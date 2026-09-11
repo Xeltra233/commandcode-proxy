@@ -79,7 +79,7 @@ func (c *ccClient) planAccessFor(ctx context.Context, key *UpstreamKey) (*planAc
 	}
 	pa, err := c.fetchPlanAccess(ctx, key)
 	if err != nil {
-		c.log.Debug("Plan detection failed", "key", key.label(), "error", err.Error())
+		c.log.Warn("Plan detection failed, model list NOT plan-filtered (fail-open); check key/network or set CC_PLAN", "key", key.label(), "error", err.Error())
 		c.planDetector.put(key.Value, nil, planDetectFailTTL)
 		return nil, false
 	}
