@@ -155,13 +155,18 @@ func (c *ccClient) fetchPlanAccess(ctx context.Context, key *UpstreamKey) (*plan
 
 	pa := &planAccess{}
 	// credits 与 subscriptions 并行（与 CLI fetchUsageData 一致）；任一成功即可
+	// 个人账号 whoami 返回 org:null —— 此时与 CLI 一致，省略 orgId 参数
+	billingQuery := ""
+	if orgID != "" {
+		billingQuery = "?orgId=" + orgID
+	}
 	var wg sync.WaitGroup
 	var mu sync.Mutex
 	var firstErr error
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
-		body, err := get("/alpha/billing/credits?orgId=" + orgID)
+		body, err := get("/alpha/billing/credits" + billingQuery)
 		if err != nil {
 			mu.Lock()
 			firstErr = err
@@ -179,7 +184,7 @@ func (c *ccClient) fetchPlanAccess(ctx context.Context, key *UpstreamKey) (*plan
 	}()
 	go func() {
 		defer wg.Done()
-		body, err := get("/alpha/billing/subscriptions?orgId=" + orgID)
+		body, err := get("/alpha/billing/subscriptions" + billingQuery)
 		if err != nil {
 			mu.Lock()
 			firstErr = err
