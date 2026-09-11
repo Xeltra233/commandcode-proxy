@@ -2,47 +2,70 @@
 
 > [中文文档](README_zh.md)
 
-A reverse proxy that converts Command Code API to OpenAI / Anthropic compatible endpoints. Single file, zero external dependencies.
+A reverse proxy that converts Command Code API to OpenAI / Anthropic / OpenAI-Responses compatible endpoints. Implemented in Go: a single static binary, zero third-party dependencies, pooled buffers and hand-rolled JSON framing for high-throughput SSE streaming.
 
-Built by analyzing official CLI network traffic to accurately replicate the Command Code API request protocol, including device-fingerprint and lifecycle pre-requests.
-
-**Features**: OpenAI Chat Completions + Anthropic Messages API | Streaming & non-streaming | Tool calling (tool_use) | Multimodal image input | Reasoning effort | Dynamic model list | Cache hit metrics | Device fingerprint disguise (per-key, auto-refresh) | `x-api-key` auth (Anthropic SDK) | Client disconnect detection with upstream abort | Zero-output → 429 auto-retry | Consecutive timeout → 429 auto-retry | Privacy-aware logging
+**Features**: OpenAI Chat Completions + Anthropic Messages API + OpenAI Responses API | Streaming & non-streaming | Tool calling (tool_use) | Multimodal image input | Reasoning effort | Dynamic model list | Cache hit metrics | Device fingerprint disguise (per-key, auto-refresh) | **Upstream key pool** with round-robin/random rotation, failover and cooldown | **Downstream client keys** (issue keys to your users without exposing upstream keys) | `x-api-key` auth (Anthropic SDK) | Client disconnect detection with upstream abort | Zero-output → 429 auto-retry | Consecutive timeout → 429 auto-retry | Privacy-aware logging | Never crashes on a malformed `PORT` — falls back through candidate ports
 
 **Community**: [Linux.do](https://linux.do) — a friendly Chinese tech community.
 
 ## Quick Start
 
-```bash
-npm start        # Start (the repo ships with config.json listening on http://0.0.0.0:3050)
-npm run dev      # Watch mode (auto-reload on file changes)
-```
-
-API Key is passed via the `Authorization` request header (or `x-api-key` for Anthropic SDKs) — no need to store it in config files. Key must start with `user_` (automatically matched with any prefix, e.g. `Bearer token_user_xxx`):
+Build (Go 1.23+), or use Docker:
 
 ```bash
-curl http://127.0.0.1:3050/v1/chat/completions \
-  -H "Authorization: Bearer user_xxxxxxxxx" \
-  -H "Content-Type: application/json" \
-  -d '{"model":"deepseek/deepseek-v4-flash","messages":[{"role":"user","content":"hi"}]}'
+go build -o cc-proxy .      # or: docker compose up -d
+./cc-proxy                  # listens on http://0.0.0.0:3050 (config.json ships with 3050)
 ```
+
+Point it at your Command Code key(s) and start calling:
+
+```bash
+CC_UPSTREAM_KEYS=user_xxxxxxxxx ./cc-proxy
+```
+
+Keys are passed per request via the `Authorization` header (or `x-api-key` for Anthropic SDKs). A key must start with `user_` (any prefix is auto-cleaned, e.g. `Bearer token_user_xxx`):
+
+```bash
+curl http://127.0.0.1:3050/v1/chat/completions   -H "Authorization: Bearer user_xxxxxxxxx"   -H "Content-Type: application/json"   -d '{"model":"deepseek/deepseek-v4-flash","messages":[{"role":"user","content":"hi"}]}'
+```
+
+### Two-tier keys (optional)
+
+By default the proxy runs in **pass-through** mode: the key your client sends is used as the upstream key. Configure `CC_CLIENT_KEYS` to switch to **distribution** mode — you hand out proxy-issued keys to clients while the proxy rotates a private pool of upstream keys:
+
+```bash
+CC_UPSTREAM_KEYS="user_aaa,user_bbb,user_ccc" CC_CLIENT_KEYS="ck_alice,ck_bob" ./cc-proxy
+```
+
+| Mode | Trigger | Incoming key | Upstream key |
+|---|---|---|---|
+| Pass-through | no `clientKeys` configured | any `user_` key | the client's own key (fallback: configured upstream key) |
+| Distribution | `clientKeys` configured | must match a client key | taken from the upstream pool, never exposed |
+| BYO blocked | distribution mode | client's `user_` key | rejected with `401` |
+
+Upstream keys rotate `round_robin` (default) or `random`; on `401/403/429` the key is cooled down and the next one is tried (`CC_KEY_FAILOVER`).
 
 ## File Structure
 
 ```
-commandcode/
-├── config.json           # Port / log path etc.
-├── LICENSE               # MIT License
-├── package.json          # npm start / npm run dev
-├── proxy.mjs             # Single-file proxy core (~1900 lines)
-├── Dockerfile            # Container build (node:22-alpine)
-├── docker-compose.yml    # Container orchestration
-├── .dockerignore         # Build context exclusions
-├── .github/
-│   └── workflows/
-│       └── docker-publish.yml  # GHCR multi-arch publish on v* tags
-├── captured-requests/    # Captured CLI traffic (protocol analysis reference)
-├── README.md             # This document (English)
-└── README_zh.md          # Chinese documentation
+commandcode-proxy/
+├── main.go               # Entry: config wiring, routes, graceful shutdown, port fallback
+├── config.go / config_test.go
+├── keys.go               # Upstream key pool (rotation/failover/cooldown) + client key auth
+├── cc.go / ccbuild.go    # CC upstream client, fingerprint, NDJSON, request building
+├── translate.go / jsonx.go
+├── server.go             # Failover orchestration, error mapping, auth
+├── openai.go             # /v1/chat/completions
+├── anthropic.go          # /v1/messages
+├── responses.go          # /v1/responses
+├── gemini.go             # /v1beta/models/{model}:generateContent
+├── httpx.go / logx.go    # SSE writer, body limits, logging
+├── go.mod                # Go 1.23, zero third-party dependencies
+├── config.json           # Port / keys / log path etc.
+├── testdata/stub_cc.py   # Stub upstream for e2e testing
+├── Dockerfile            # Multi-stage Go build → alpine runtime
+├── docker-compose.yml
+└── .github/workflows/    # go.yml (build/test) + docker-publish.yml (GHCR)
 ```
 
 ## Configuration
@@ -54,38 +77,42 @@ commandcode/
 | `port` | `3000` | Listen port (repo config.json ships with `3050`) |
 | `host` | `0.0.0.0` | Listen address |
 | `apiBase` | `https://api.commandcode.ai` | CC API base URL |
-| `projectSlug` | `cc-proxy` | `x-project-slug` header |
-| `apiKey` | `""` | Optional fallback API key (requests can also send it via header) |
-| `logFile` | `""` | Log file path (empty = console only) |
-| `logLevel` | `info` | Log level |
+| `projectSlug` | `""` | `x-project-slug` header (empty = per-session CLI-compatible slug) |
+| `upstreamKeys` | `[]` | Upstream key pool, e.g. `[{"key":"user_xxx","name":"main"}]` |
+| `clientKeys` | `[]` | Keys issued to downstream clients |
+| `allowByoKeys` | auto | Allow clients to bring their own `user_` key (default: on when no `clientKeys`) |
+| `keyStrategy` | `round_robin` | Upstream key rotation: `round_robin` / `random` |
+| `keyFailover` | `1` | Extra upstream keys to try on 401/403/429 per request |
+| `keyCooldownMs` | `60000` | Cooldown for a failed upstream key |
+| `logFile` / `logLevel` | `""` / `info` | Logging |
 | `useProviderModels` | `true` | Dynamically fetch model list from Provider API |
 | `modelRefreshIntervalMs` | `300000` | Model list cache refresh interval (5 min) |
 | `zdr` | `false` | Request ZDR-only routing from Command Code |
+| `maxBodyMB` | `100` | Request body limit (413 beyond) |
 
 ### Environment Variables
 
 | Variable | Overrides |
 |----------|-----------|
-| `PORT` | `port` |
+| `PORT` / `CC_PORT` | `port` — tolerates `tcp://0.0.0.0:3050`, `[::]:3050`, `8080/tcp` forms; other `*_PORT` vars act as fallback candidates; never crashes |
 | `HOST` | `host` |
 | `CC_API_BASE` | `apiBase` |
-| `PROJECT_SLUG` | `projectSlug` |
-| `LOG_FILE` | `logFile` |
+| `CC_UPSTREAM_KEYS` / `CC_API_KEYS` | `upstreamKeys` (comma-separated) |
+| `CC_CLIENT_KEYS` / `PROXY_API_KEYS` | `clientKeys` (comma-separated) |
+| `CC_ALLOW_BYO` | `allowByoKeys` |
+| `CC_KEY_STRATEGY` / `CC_KEY_FAILOVER` / `CC_KEY_COOLDOWN_MS` | key pool tuning |
 | `CC_USE_PROVIDER_MODELS` | `useProviderModels` |
 | `CC_STREAM_IDLE_MS` | Streaming upstream read idle timeout (default `30000`) |
 | `CC_NONSTREAM_IDLE_MS` | Non-streaming upstream read idle timeout (default `90000`) |
 | `CC_MAX_INFLIGHT` | In-process concurrent request cap (default `0` = unlimited) |
+| `CC_MAX_BODY_MB` | `maxBodyMB` |
 | `CMD_ZDR` | `zdr` (`1` to enable) |
 
-When enabled, the proxy sends `x-cmd-zdr: 1` on Command Code generation requests
+When ZDR is enabled, the proxy sends `x-cmd-zdr: 1` on Command Code generation requests
 and the fingerprint/lifecycle initialization requests. It does not add the header
 to the npm version check or the proxy's `/provider/v1/models` catalog request.
 This requests Command Code's ZDR-only routing; the upstream service remains the
 authority for actual retention and provider availability.
-
-**Request body limit**: independent of `config.json` — requests larger than **100 MB** are rejected with `HTTP 413` (the connection is kept alive and drained, not reset). Override with `CC_MAX_BODY_MB` (positive integer, unit: MB).
-
-> ⚠️ **Memory amplification**: a request body exists in several copies before it reaches upstream; measured peak ≈ body size × **5.1–7.4** (7 MB → +52 MB, 20 MB → +116 MB, while a request rejected with `413` costs only ×1.05). The default `CC_MAX_BODY_MB=100` therefore implies up to ~550 MB for a **single** request, and that limit is per-request, not global. See [Memory & Deployment](#memory--deployment).
 
 ## API Endpoints
 
@@ -249,6 +276,36 @@ data: {"type":"message_stop"}
 }
 ```
 
+### `POST /v1/responses`
+
+OpenAI **Responses API** compatible (used by Codex and other Responses-native clients). Supports streaming (typed events with `sequence_number`), function calling, and reasoning summaries. `previous_response_id` / `store` are rejected with `400` — the proxy is stateless, send the full `input` each turn.
+
+**Streaming event sequence:**
+```
+event: response.created
+event: response.in_progress
+event: response.output_item.added
+event: response.content_part.added
+event: response.output_text.delta
+event: response.output_text.done
+event: response.content_part.done
+event: response.output_item.done
+event: response.completed   (or response.incomplete on max_output_tokens)
+```
+
+**Usage semantics**: `input_tokens` is the total (including cached), `input_tokens_details.cached_tokens` is the cached subset — same as OpenAI.
+
+### `POST /v1beta/models/{model}:generateContent`
+
+Google **Gemini API** compatible. Model name is taken from the path (slashes allowed, e.g. `/v1beta/models/deepseek/deepseek-v4-flash:generateContent`). Auth via `x-goog-api-key` header or `?key=` query parameter.
+
+- `:generateContent` — non-streaming `GenerateContentResponse`
+- `:streamGenerateContent?alt=sse` — SSE stream
+- `:streamGenerateContent` (no `alt=sse`) — JSON array of chunks
+- `GET /v1beta/models` — Gemini-format model list
+
+Mappings: `systemInstruction` → system message, `inlineData` → image part, `functionCall`/`functionResponse` → tool calls/results (paired by name), `toolConfig.functionCallingConfig.mode` (`AUTO`/`ANY`/`NONE`) → `tool_choice`, `generationConfig.thinkingConfig.thinkingBudget` → reasoning effort. Thought summaries are returned as `parts[].thought: true`.
+
 ### `GET /v1/models`
 
 Returns available model list. Fetched dynamically from Provider API (5 min cache), falls back to hardcoded list on failure.
@@ -368,11 +425,11 @@ Based on analysis of official CLI traffic (version auto-fetched from npm registr
 | **Environment** | `x-cli-environment: production`, `x-co-flag: "false"`, `x-taste-learning: "false"` |
 | **Project Slug** | `x-project-slug` generated from session ID (CLI-compatible format) |
 | **Reasoning Effort** | `reasoning_effort` pass-through (low/medium/high/max) |
-| **Key Validation** | Regex `user_[a-zA-Z0-9_-]+` on `Authorization: Bearer` or `x-api-key`, auto-cleans extra paths/prefixes, rejects `sk-xxx` format |
+| **Key Validation** | Regex `user_[a-zA-Z0-9_-]+` on `Authorization: Bearer`, `x-api-key`, `x-goog-api-key` or `?key=`, auto-cleans extra paths/prefixes, rejects `sk-xxx` format |
 | **Stream Timeout** | 30s streaming / 90s non-streaming → 429 with SDK auto-retry |
 | **Consecutive Timeout** | 3 consecutive timeouts before "reduce context" hint |
 | **Zero-Output Guard** | outputTokens=0 → 429 `rate_limit_error` (SDK auto-retry, anti false billing) |
-| **Upstream Abort** | `AbortController` on client disconnect + all error paths |
+| **Upstream Abort** | Go request-context cancellation: client disconnect or any error path aborts the upstream request |
 | **Privacy Logging** | No API key fragments, no error bodies, no stack traces in logs |
 
 ## Protocol Details
@@ -432,7 +489,7 @@ Pre-built multi-arch images (`linux/amd64` + `linux/arm64`) are published to the
 
 ```bash
 docker pull ghcr.io/maxeaglet/commandcode-proxy:latest
-docker run -d --name cc-proxy -p 3050:3050 -e PORT=3050 ghcr.io/maxeaglet/commandcode-proxy:latest
+docker run -d --name cc-proxy -p 3050:3050   -e PORT=3050   -e CC_UPSTREAM_KEYS=user_xxxxxxxxx   ghcr.io/maxeaglet/commandcode-proxy:latest
 ```
 
 The `latest` tag is updated on each release. The image is public — no login required to pull.
@@ -453,13 +510,15 @@ PROXY_PORT=13050 docker compose up -d
 
 ```bash
 docker build -t commandcode-proxy:latest .
-docker run -d -p 3050:3050 -e PORT=3050 commandcode-proxy:latest
+docker run -d -p 3050:3050 -e PORT=3050 -e CC_UPSTREAM_KEYS=user_xxxxxxxxx commandcode-proxy:latest
 ```
 
 ### Multi-Architecture Build
 
+The publish workflow builds `linux/amd64` + `linux/arm64` automatically on `v*` tags. To build locally:
+
 ```bash
-npm run docker:build:multi
+docker buildx build --platform linux/amd64,linux/arm64 -t commandcode-proxy:latest .
 ```
 
 ### Environment Variables
@@ -478,10 +537,10 @@ npm run docker:build:multi
 
 **Off by default** (`CC_MAX_INFLIGHT` unset = no concurrency limit), so existing behaviour is unchanged.
 
-This project is a **pure proxy layer**; concurrency control belongs downstream — use your reverse proxy for per-IP / per-key limits (see the `limit_conn` block in [Memory & Deployment](#memory--deployment)). This option is **not** a replacement for that; it only covers running **without** a reverse proxy (which both the Dockerfile and `npm start` invite) with an in-process, **global-only** guard:
+This project is a **pure proxy layer**; concurrency control belongs downstream — use your reverse proxy for per-IP / per-key limits (see the `limit_conn` block in [Memory & Deployment](#memory--deployment)). This option is **not** a replacement for that; it only covers running **without** a reverse proxy with an in-process, **global-only** guard:
 
 ```bash
-CC_MAX_INFLIGHT=32 npm start    # at most 32 concurrent requests
+CC_MAX_INFLIGHT=32 ./cc-proxy    # at most 32 concurrent requests
 ```
 
 Over the limit it returns `503` + `Retry-After: 5` + `type: server_busy` — a shape the official OpenAI / Anthropic SDKs retry with backoff, instead of the client seeing a connection reset. `/health` and `/` are exempt so liveness probes and orchestrators never receive a 503 because business traffic is busy.
@@ -506,47 +565,22 @@ Two upstream read idle watchdogs; on expiry the proxy returns `429` (with `retry
 If you see `429 Response timeout` or `zero output tokens` where the log shows `elapsedMs ≈ 30000` and `bytesReceived = 0`, the watchdog killed a healthy stall — raise it:
 
 ```bash
-CC_STREAM_IDLE_MS=300000 npm start      # 5 minutes
+CC_STREAM_IDLE_MS=300000 ./cc-proxy      # 5 minutes
 ```
 
 > ⚠️ A false kill costs more than one failed request: the abort returns `429 + retry_after`, the SDK retries automatically, and a retry **resends the entire context** — so each false kill re-pays the full prefill on long conversations.
 
 ## Memory & Deployment
 
-> Measurements reproduced from [issue #20](https://github.com/MAXeaglet/commandcode-proxy/issues/20) (Node v24, loopback mock upstream).
+The Go implementation keeps at most ~2 copies of a request body (raw bytes + parsed structure) instead of the ~5–7 copies a Node string/Buffer pipeline produces, and streams all four protocol translations without buffering whole responses. Streaming backpressure propagates upstream: when the client stops reading, the SSE writer stops, the upstream read stalls, and the idle watchdog eventually closes the connection — no unbounded response buffering.
 
-Rule of thumb for per-request memory:
+Still, the same deployment rules apply:
 
-```
-RSS ≈ 70 MB + in-flight × (0.13 MB + 5.5 × body_MB)
-```
+### Request body limit
 
-### Streaming responses apply backpressure
-
-When `res.write()` returns `false` (the socket write buffer passed `highWaterMark`), reading from upstream pauses, so the response no longer accumulates unbounded in memory:
-
-| Scenario (200 MB upstream stream, client stops reading after sending) | Peak RSS delta |
-|---|---|
-| Before the fix | **+586 MB** (66 → 652 MB) |
-| After the fix | **+4 MB** (backpressure propagates upstream, which stalls after ~8 MB) |
-
-This is not only a hostile-client problem — throttled/mobile links, a client blocked on tool execution, or a client that already gave up but whose TCP stack has not sent RST all trigger it.
-
-### Request body is ~5.5× its size
-
-The body exists in several copies before being forwarded: `chunks[]` / `Buffer.concat` / utf8 string / `JSON.parse` object tree / `buildCcRequest` second object tree / `JSON.stringify` serialized body.
-
-| body | cap | peak delta | status |
-|---|---|---|---|
-| 7 MB | 100 MB | +52 MB (7.4×) | 200 |
-| 20 MB | 100 MB | +116 MB (5.8×) | 200 |
-| 20 MB | 8 MB | +21 MB (1.05×) | **413** |
-
-At startup a `warn` is logged when the implied worst case is ≥ 500 MB. The limit is **per request** and the proxy does no in-flight limiting of its own — a public deployment must add both at the reverse proxy.
+Requests larger than `CC_MAX_BODY_MB` (default **100 MB**) are rejected with `HTTP 413` before being parsed. The limit is **per request**; a public deployment should also bound concurrency at the reverse proxy.
 
 ### Suggested nginx front
-
-Rejecting in nginx means the body is never materialized in the Node process at all:
 
 ```nginx
 map $http_authorization $cc_key { default $http_authorization; "" $http_x_api_key; }
@@ -572,35 +606,19 @@ location /v1/ {
 
 ### Stalled clients (neither reading nor disconnecting)
 
-Once backpressure is in effect, a client that **neither reads nor disconnects** keeps its request and upstream connection alive indefinitely. Measured residual cost:
-
-| Stalled connections | RSS delta | Upstream connections held |
-|---|---|---|
-| 1 | +5 MB | 1 |
-| 10 | +45 MB | 10 |
-| 50 | +248 MB | 50 (**held forever**) |
-
-The cost is **bounded, does not leak, and is reclaimed as soon as the client disconnects** (the RSS curve stays flat) — but the **number of connections itself is unbounded**.
-
-This is left unhandled by default, because a stalled client is indistinguishable at the protocol level from a *legitimate* client blocked on tool execution, and the official CLI has no upstream idle timeout at all (see [#19](https://github.com/MAXeaglet/commandcode-proxy/issues/19)) — adding an aggressive timeout would repeat the mistake of killing healthy requests.
-
-To cap it, opt in:
+A client that neither reads nor disconnects holds its upstream connection. Opt in to a write deadline that drops such clients (a client making any drain progress never triggers it):
 
 ```bash
-# only drop a client that has been blocked downstream for over 60s;
-# a client that keeps making drain progress never triggers this
-CC_CLIENT_DRAIN_TIMEOUT_MS=60000 npm start
+CC_CLIENT_STALL_MS=60000 ./cc-proxy
 ```
-
-Measured with the timeout enabled (50 stalled connections): upstream connections held goes from **50 (forever) → 0**, with **no** post-drop draining of upstream.
 
 A more robust cap still belongs at the reverse proxy (`limit_conn`), since only it knows how much concurrency a given deployment can afford.
 
 ### Other notes
 
-- **`logFile` uses `appendFileSync`** — synchronous writes on the event loop. Under public load they serialize the loop; prefer leaving it empty and collecting stdout.
-- **systemd guard rails**: set `MemoryMax=` and `NODE_OPTIONS=--max-old-space-size=` so an overshoot kills the proxy, not `sshd`/`nginx`.
-- **Multi-account + multiple instances**: `sessionStore` / `keyStateStore` are per-process `Map`s, so the same API key served by two instances gets two different sessions and **two different device fingerprints** — upstream sees one account on multiple machines. Scale with consistent hashing on the API key (`hash $cc_key consistent`), not round-robin.
+- **Log file**: prefer leaving `logFile` empty and collecting stdout; the logger writes to stdout asynchronously through the OS pipe buffer.
+- **systemd guard rails**: set `MemoryMax=` so an overshoot kills the proxy, not `sshd`/`nginx`.
+- **Multi-account + multiple instances**: per-key session and fingerprint state lives in process memory, so the same API key served by two instances gets two different sessions and **two different device fingerprints** — upstream sees one account on multiple machines. Scale with consistent hashing on the API key (`hash $cc_key consistent`), not round-robin.
 
 ## Disclaimer
 
@@ -617,6 +635,9 @@ This project is for **educational and research purposes** only.
 ## Development
 
 ```bash
-# Start with watch mode (auto-reload on file changes)
-npm run dev
+go vet ./...
+go test -race ./...
+go build -o cc-proxy .
+python testdata/stub_cc.py 9701 &     # stub CC upstream
+CC_API_BASE=http://127.0.0.1:9701 CC_UPSTREAM_KEYS=user_test ./cc-proxy
 ```

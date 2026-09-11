@@ -2,47 +2,70 @@
 
 > [English Docs](README.md)
 
-将 Command Code API 转换为 OpenAI / Anthropic 兼容接口的反代代理。单文件，零外部依赖。
+将 Command Code API 转换为 OpenAI / Anthropic / OpenAI-Responses / Gemini 兼容接口的反代代理。Go 实现：单个静态二进制，零第三方依赖，池化缓冲与手写 JSON 帧拼装，面向高吞吐 SSE 流式场景。
 
-基于对官方 CLI 网络流量的分析，精确还原了 Command Code API 的请求协议（含设备指纹与生命周期预请求），并实现了多层兼容适配。
-
-**完整功能**：OpenAI Chat Completions + Anthropic Messages API | 流式/非流式输出 | 工具调用 (tool_use) | 多模态图片输入 | 推理强度 (reasoning_effort) | 动态模型列表 | 缓存命中指标 | 设备指纹伪装（per-key 绑定、自动刷新）| `x-api-key` 鉴权（Anthropic SDK）| 客户端断连检测（上游中止） | 零输出 → 429 自动重试 | 连续超时 → 429 自动重试 | 隐私保护日志
+**完整功能**：OpenAI Chat Completions + Anthropic Messages API + OpenAI Responses API + Google Gemini API | 流式/非流式输出 | 工具调用 (tool_use) | 多模态图片输入 | 推理强度 (reasoning_effort) | 动态模型列表 | 缓存命中指标 | 设备指纹伪装（per-key 绑定、自动刷新）| **上游 key 池**（round_robin/random 轮换、失败冷却、自动故障转移）| **下游分发 key**（给客户端发 key，不暴露上游 key）| `x-api-key` / `x-goog-api-key` 鉴权 | 客户端断连检测（上游中止）| 零输出 → 429 自动重试 | 连续超时 → 429 自动重试 | 隐私保护日志 | 非法 `PORT` 不崩溃——按候选端口兜底
 
 **社区**: [Linux.do](https://linux.do) — 一个友好的中文技术社区。
 
 ## 快速开始
 
-```bash
-npm start        # 启动（仓库自带 config.json，监听 http://0.0.0.0:3050）
-npm run dev      # watch 模式（文件修改自动重启）
-```
-
-API Key 通过 `Authorization` 请求头（Anthropic SDK 可用 `x-api-key`）传入，**无需配置到文件中**。Key 必须以 `user_` 开头（自动匹配任意前缀，如 `Bearer token_user_xxx`）：
+编译（Go 1.23+）或直接用 Docker：
 
 ```bash
-curl http://127.0.0.1:3050/v1/chat/completions \
-  -H "Authorization: Bearer user_xxxxxxxxx" \
-  -H "Content-Type: application/json" \
-  -d '{"model":"deepseek/deepseek-v4-flash","messages":[{"role":"user","content":"hi"}]}'
+go build -o cc-proxy .      # 或：docker compose up -d
+./cc-proxy                  # 监听 http://0.0.0.0:3050（仓库自带 config.json）
 ```
+
+配置上游 key 并启动：
+
+```bash
+CC_UPSTREAM_KEYS=user_xxxxxxxxx ./cc-proxy
+```
+
+Key 通过 `Authorization` 请求头（Anthropic SDK 可用 `x-api-key`，Gemini SDK 可用 `x-goog-api-key` 或 `?key=`）传入。Key 必须以 `user_` 开头（自动匹配任意前缀，如 `Bearer token_user_xxx`）：
+
+```bash
+curl http://127.0.0.1:3050/v1/chat/completions   -H "Authorization: Bearer user_xxxxxxxxx"   -H "Content-Type: application/json"   -d '{"model":"deepseek/deepseek-v4-flash","messages":[{"role":"user","content":"hi"}]}'
+```
+
+### 双层 key（可选）
+
+默认是**透传模式**：客户端带的 key 直接当上游 key 用。配置 `CC_CLIENT_KEYS` 即切换为**分发模式**——向下游发放代理自签的 key，上游 key 池私有轮换：
+
+```bash
+CC_UPSTREAM_KEYS="user_aaa,user_bbb,user_ccc" CC_CLIENT_KEYS="ck_alice,ck_bob" ./cc-proxy
+```
+
+| 模式 | 触发条件 | 入站 key | 上游 key |
+|---|---|---|---|
+| 透传 | 未配置 `clientKeys` | 任意 `user_` key | 客户端自带（回退：配置的上游 key） |
+| 分发 | 配置了 `clientKeys` | 必须匹配某个 client key | 从上游池轮换取用，永不暴露 |
+| BYO 关闭 | 分发模式 | 客户端自带 `user_` key | `401` 拒绝 |
+
+上游 key 按 `round_robin`（默认）或 `random` 轮换；遇 `401/403/429` 冷却该 key 并换下一个（`CC_KEY_FAILOVER`）。
 
 ## 文件结构
 
 ```
-commandcode/
-├── config.json           # 端口 / 日志路径等
-├── LICENSE               # MIT License
-├── package.json          # npm start / npm run dev
-├── proxy.mjs             # 单文件核心代理（~1900 行）
-├── Dockerfile            # 容器构建文件（node:22-alpine）
-├── docker-compose.yml    # 容器编排
-├── .dockerignore         # 构建上下文排除规则
-├── .github/
-│   └── workflows/
-│       └── docker-publish.yml  # 打 v* tag 时自动发布 GHCR 多架构镜像
-├── captured-requests/    # CLI 抓包数据（协议逆向参考）
-├── README.md             # 英文文档
-└── README_zh.md          # 本文档（中文）
+commandcode-proxy/
+├── main.go               # 入口：配置装配、路由、优雅退出、端口兜底
+├── config.go / config_test.go
+├── keys.go               # 上游 key 池（轮换/故障转移/冷却）+ 客户端 key 鉴权
+├── cc.go / ccbuild.go    # CC 上游客户端、指纹、NDJSON、请求体构建
+├── translate.go / jsonx.go
+├── server.go             # 故障转移编排、错误映射、鉴权
+├── openai.go             # /v1/chat/completions
+├── anthropic.go          # /v1/messages
+├── responses.go          # /v1/responses
+├── gemini.go             # /v1beta/models/{model}:generateContent
+├── httpx.go / logx.go    # SSE 写出、请求体上限、日志
+├── go.mod                # Go 1.23，零第三方依赖
+├── config.json           # 端口 / key / 日志等
+├── testdata/stub_cc.py   # e2e 测试用 CC 上游桩
+├── Dockerfile            # 多阶段 Go 构建 → alpine 运行时
+├── docker-compose.yml
+└── .github/workflows/    # go.yml（构建/测试）+ docker-publish.yml（GHCR）
 ```
 
 ## 配置
@@ -54,36 +77,40 @@ commandcode/
 | `port` | `3000` | 监听端口（仓库自带 config.json 为 3050） |
 | `host` | `0.0.0.0` | 监听地址 |
 | `apiBase` | `https://api.commandcode.ai` | CC API 地址 |
-| `projectSlug` | `cc-proxy` | `x-project-slug` header |
-| `apiKey` | `""` | 可选兜底 API Key（请求也可通过 header 传入） |
-| `logFile` | `""` | 日志文件路径（空=仅控制台） |
-| `logLevel` | `info` | 日志级别 |
+| `projectSlug` | `""` | `x-project-slug` header（空 = 按会话生成 CLI 兼容 slug） |
+| `upstreamKeys` | `[]` | 上游 key 池，如 `[{"key":"user_xxx","name":"main"}]` |
+| `clientKeys` | `[]` | 向下游分发的客户端 key |
+| `allowByoKeys` | 自动 | 允许客户端自带 `user_` key（默认：未配置 `clientKeys` 时开启） |
+| `keyStrategy` | `round_robin` | 上游 key 轮换：`round_robin` / `random` |
+| `keyFailover` | `1` | 单请求遇 401/403/429 时额外尝试的上游 key 数 |
+| `keyCooldownMs` | `60000` | 失败上游 key 的冷却时长 |
+| `logFile` / `logLevel` | `""` / `info` | 日志 |
 | `useProviderModels` | `true` | 从 Provider API 动态拉取模型列表 |
 | `modelRefreshIntervalMs` | `300000` | 模型列表缓存刷新间隔（5min） |
 | `zdr` | `false` | 请求 Command Code 使用 ZDR-only 路由 |
+| `maxBodyMB` | `100` | 请求体上限（超出 413） |
 
 ### 环境变量
 
 | 变量 | 对应 config 字段 |
 |------|-----------------|
-| `PORT` | `port` |
+| `PORT` / `CC_PORT` | `port` —— 容忍 `tcp://0.0.0.0:3050`、`[::]:3050`、`8080/tcp` 等写法；其它 `*_PORT` 变量作为兜底候选；永不崩溃 |
 | `HOST` | `host` |
 | `CC_API_BASE` | `apiBase` |
-| `PROJECT_SLUG` | `projectSlug` |
-| `LOG_FILE` | `logFile` |
+| `CC_UPSTREAM_KEYS` / `CC_API_KEYS` | `upstreamKeys`（逗号分隔） |
+| `CC_CLIENT_KEYS` / `PROXY_API_KEYS` | `clientKeys`（逗号分隔） |
+| `CC_ALLOW_BYO` | `allowByoKeys` |
+| `CC_KEY_STRATEGY` / `CC_KEY_FAILOVER` / `CC_KEY_COOLDOWN_MS` | key 池调优 |
 | `CC_USE_PROVIDER_MODELS` | `useProviderModels` |
 | `CC_STREAM_IDLE_MS` | 流式上游读空闲超时（默认 `30000`）|
 | `CC_NONSTREAM_IDLE_MS` | 非流式上游读空闲超时（默认 `90000`）|
 | `CC_MAX_INFLIGHT` | 进程内在途请求上限（默认 `0` = 不限）|
+| `CC_MAX_BODY_MB` | `maxBodyMB` |
 | `CMD_ZDR` | `zdr`（`1` 开启） |
 
-开启后，代理会在 Command Code 生成请求以及 fingerprint/lifecycle 初始化请求中附加
+开启 ZDR 后，代理会在 Command Code 生成请求以及 fingerprint/lifecycle 初始化请求中附加
 `x-cmd-zdr: 1`。npm 版本检查和代理自己的 `/provider/v1/models` 模型目录请求不会附加该
 header。该开关只是请求 Command Code 使用 ZDR-only 路由，实际数据留存和上游可用性仍由上游服务决定。
-
-**请求体上限**：独立于 `config.json` —— 超过 **100MB** 的请求会被拒绝并返回 `HTTP 413`（连接保持可排空，不会直接 reset）。可用 `CC_MAX_BODY_MB`（正整数，单位 MB）覆盖。
-
-> ⚠️ **内存放大**：请求体在转发到上游前会存在多份副本，实测峰值 ≈ body 大小 × **5.1~7.4**（7MB→+52MB、20MB→+116MB；被 `413` 拒绝的请求只要 ×1.05）。因此默认 `CC_MAX_BODY_MB=100` 意味着**单个请求**最坏可吃 ~550MB，且该上限是每请求的、不是全局的。详见[内存与部署](#内存与部署)。
 
 ## API 接口
 
@@ -247,6 +274,36 @@ data: {"type":"message_stop"}
 }
 ```
 
+### `POST /v1/responses`
+
+OpenAI **Responses API** 兼容（Codex 等 Responses 原生客户端）。支持流式（带 `sequence_number` 的具名事件）、函数调用与 reasoning 摘要。`previous_response_id` / `store` 返回 `400` —— 代理无状态，每轮请发完整 `input`。
+
+**流式事件序列：**
+```
+event: response.created
+event: response.in_progress
+event: response.output_item.added
+event: response.content_part.added
+event: response.output_text.delta
+event: response.output_text.done
+event: response.content_part.done
+event: response.output_item.done
+event: response.completed   （或 max_output_tokens 触发 response.incomplete）
+```
+
+**usage 语义**：`input_tokens` 为总数（含缓存），`input_tokens_details.cached_tokens` 是其中缓存部分 —— 与 OpenAI 语义一致。
+
+### `POST /v1beta/models/{model}:generateContent`
+
+Google **Gemini API** 兼容。模型名从路径取（可含斜杠，如 `/v1beta/models/deepseek/deepseek-v4-flash:generateContent`）。鉴权用 `x-goog-api-key` 头或 `?key=` 查询参数。
+
+- `:generateContent` —— 非流式 `GenerateContentResponse`
+- `:streamGenerateContent?alt=sse` —— SSE 流
+- `:streamGenerateContent`（无 `alt=sse`）—— JSON 数组
+- `GET /v1beta/models` —— Gemini 格式模型列表
+
+映射：`systemInstruction` → system 消息、`inlineData` → 图片 part、`functionCall`/`functionResponse` → 工具调用/结果（按 name 配对）、`toolConfig.functionCallingConfig.mode`（`AUTO`/`ANY`/`NONE`）→ `tool_choice`、`generationConfig.thinkingConfig.thinkingBudget` → 推理强度。思考摘要以 `parts[].thought: true` 返回。
+
 ### `GET /v1/models`
 
 返回可用模型列表。优先从 Provider API 动态拉取（5min 缓存），失败回退硬编码列表。
@@ -260,7 +317,7 @@ data: {"type":"message_stop"}
 | HTTP 状态 | 说明 |
 |-----------|------|
 | 400 | 请求格式错误 |
-| 401 | API Key 缺失/格式不对/无效（Key 必须以 `user_` 开头；通过 `Authorization: Bearer` 或 `x-api-key` 传入） |
+| 401 | API Key 缺失/格式不对/无效（Key 必须以 `user_` 开头；通过 `Authorization: Bearer`、`x-api-key`、`x-goog-api-key` 或 `?key=` 传入） |
 | 429 | 零输出 token，或流空闲超时（30s 流式 / 90s 非流式）——带 `Retry-After`，SDK 自动重试；连续 3 次超时返回"压缩上下文"提示 |
 | 502 | CC 上游错误 |
 
@@ -370,7 +427,7 @@ Anthropic SDK 通过 `x-api-key` 头鉴权——代理已原生支持（无需 `
 | **流式超时保护** | 流式 30s、非流式 90s → 429 + SDK 自动重试 |
 | **连续超时阈值** | 连续 3 次超时后才提示压缩上下文 |
 | **零输出防护** | outputTokens=0 → 429 `rate_limit_error`（SDK 自动重试，反异常计费） |
-| **上游中止** | 客户端断连 + 全部错误路径 `AbortController` 打断 CC |
+| **上游中止** | Go 请求上下文取消：客户端断连或任意错误路径立即中止上游请求 |
 | **隐私保护日志** | 日志不含 API Key 片段、错误 body、stack trace |
 
 ## 协议细节
@@ -430,7 +487,7 @@ CLI 发送图片的格式：
 
 ```bash
 docker pull ghcr.io/maxeaglet/commandcode-proxy:latest
-docker run -d --name cc-proxy -p 3050:3050 -e PORT=3050 ghcr.io/maxeaglet/commandcode-proxy:latest
+docker run -d --name cc-proxy -p 3050:3050 \n  -e PORT=3050 \n  -e CC_UPSTREAM_KEYS=user_xxxxxxxxx \n  ghcr.io/maxeaglet/commandcode-proxy:latest
 ```
 
 每次发版都会更新 `latest` 标签。镜像为公共可见，拉取无需登录。
@@ -451,13 +508,15 @@ PROXY_PORT=13050 docker compose up -d
 
 ```bash
 docker build -t commandcode-proxy:latest .
-docker run -d -p 3050:3050 -e PORT=3050 commandcode-proxy:latest
+docker run -d -p 3050:3050 -e PORT=3050 -e CC_UPSTREAM_KEYS=user_xxxxxxxxx commandcode-proxy:latest
 ```
 
 ### 多架构构建
 
+发布工作流会在 `v*` tag 上自动构建 `linux/amd64` + `linux/arm64`。本地构建：
+
 ```bash
-npm run docker:build:multi
+docker buildx build --platform linux/amd64,linux/arm64 -t commandcode-proxy:latest .
 ```
 
 ### 环境变量
@@ -467,7 +526,7 @@ npm run docker:build:multi
 | `PORT` | `3050` | 容器内监听端口 |
 | `PROXY_PORT` | `3050` | 主机映射端口（仅 compose） |
 | `CC_MAX_BODY_MB` | `100` | 请求体大小上限（MB），超限请求返回 `HTTP 413` |
-| `CC_CLIENT_DRAIN_TIMEOUT_MS` | 空（禁用）| 下游背压阻塞超过该毫秒数则断开该客户端并中止上游请求，见[僵死连接](#僵死连接既不读也不断开) |
+| `CC_CLIENT_STALL_MS` | 空（禁用）| 下游写阻塞超过该毫秒数则断开该客户端并中止上游请求，见[僵死连接](#僵死连接既不读也不断开) |
 | `CC_STREAM_IDLE_MS` | `30000` | 流式上游读空闲超时（毫秒），见[上游空闲超时](#上游空闲超时) |
 | `CC_NONSTREAM_IDLE_MS` | `90000` | 非流式上游读空闲超时（毫秒）|
 | `CC_MAX_INFLIGHT` | `0`（不限）| 进程内在途请求上限，超限返回 `503` + `Retry-After`，见[在途上限](#在途请求上限可选) |
@@ -477,10 +536,10 @@ npm run docker:build:multi
 **默认关闭**（`CC_MAX_INFLIGHT` 未设置 = 不限制并发），既有行为不变。
 
 本项目定位是**纯反代层**，并发控制属于下游 —— 按 IP / 按 key 的限流请用反向代理（见[内存与部署](#内存与部署)里的 `limit_conn`）。
-本项**不是**那套方案的替代品，只为「不挂反代裸跑」（Dockerfile 与 `npm start` 都支持这种用法）提供一个**进程内、仅全局**的兜底：
+本项**不是**那套方案的替代品，只为「不挂反代裸跑」提供一个**进程内、仅全局**的兜底：
 
 ```bash
-CC_MAX_INFLIGHT=32 npm start    # 最多同时处理 32 个请求
+CC_MAX_INFLIGHT=32 ./cc-proxy    # 最多同时处理 32 个请求
 ```
 
 超限时快速返回 `503` + `Retry-After: 5` + `type: server_busy` —— OpenAI / Anthropic 官方 SDK 认得这个组合会自动退避重试，而不是拿到连接被重置。`/health` 与 `/` 不计入、也不受限制，避免探活与编排器因业务繁忙收到 503。
@@ -509,7 +568,7 @@ CC_MAX_INFLIGHT=32 npm start    # 最多同时处理 32 个请求
 说明是看门狗误杀了 prefill / 首 token 阶段的正常停顿 —— 调大即可：
 
 ```bash
-CC_STREAM_IDLE_MS=300000 npm start      # 5 分钟
+CC_STREAM_IDLE_MS=300000 ./cc-proxy      # 5 分钟
 ```
 
 > ⚠️ 误杀的成本不止一次失败：被 abort 后返回 `429 + retry_after`，SDK 会自动重试，
@@ -517,40 +576,15 @@ CC_STREAM_IDLE_MS=300000 npm start      # 5 分钟
 
 ## 内存与部署
 
-> 数据来自 [issue #20](https://github.com/MAXeaglet/commandcode-proxy/issues/20) 的实测复现（Node v24，loopback mock 上游）。
+Go 实现的请求体最多保留约 2 份副本（原始字节 + 解析结构），远低于 Node 字符串/Buffer 管线的 5~7 份；四种协议翻译全程流式，不整段缓冲响应。流式背压向上游传导：客户端停止读取 → SSE 写出停止 → 上游读取停顿 → 空闲看门狗最终断连，响应不会在内存里无界堆积。
 
-单请求内存开销的经验公式：
+部署规则不变：
 
-```
-RSS ≈ 70 MB + 在途请求数 × (0.13 MB + 5.5 × body_MB)
-```
+### 请求体上限
 
-### 流式响应已做背压
-
-`res.write()` 返回 `false`（socket 写缓冲超过 `highWaterMark`）时会暂停读取上游，响应不再在内存中无界堆积：
-
-| 场景（200MB 上游流，客户端发完请求即停止读取） | 峰值 RSS 增量 |
-|---|---|
-| 修复前 | **+586 MB**（66 → 652 MB）|
-| 修复后 | **+4 MB**（背压一路传回上游，上游只吐出 ~8MB 即停住）|
-
-这不只是恶意客户端问题 —— 弱网/移动端、客户端卡在工具执行、客户端已放弃但 TCP 还没发 RST，都会触发。
-
-### 请求体放大 ~5.5×
-
-body 在转发到上游前同时存在多份副本：`chunks[]` / `Buffer.concat` / utf8 字符串 / `JSON.parse` 对象树 / `buildCcRequest` 重建对象树 / `JSON.stringify` 序列化体。
-
-| body | 上限 | 峰值增量 | 结果 |
-|---|---|---|---|
-| 7 MB | 100 MB | +52 MB（7.4×）| 200 |
-| 20 MB | 100 MB | +116 MB（5.8×）| 200 |
-| 20 MB | 8 MB | +21 MB（1.05×）| **413** |
-
-启动时若隐含最坏峰值 ≥ 500MB，日志会输出 `warn` 提示。上限是**按请求**的，proxy 自身没有在途限流 —— 公网部署必须在反向代理层补上。
+超过 `CC_MAX_BODY_MB`（默认 **100MB**）的请求在解析前即拒绝并返回 `HTTP 413`。该上限是**按请求**的，公网部署还需在反向代理层限制并发。
 
 ### nginx 反代建议
-
-`client_max_body_size` 在 nginx 拒绝时，body 根本不会进入 Node 进程：
 
 ```nginx
 map $http_authorization $cc_key { default $http_authorization; "" $http_x_api_key; }
@@ -576,34 +610,19 @@ location /v1/ {
 
 ### 僵死连接（既不读也不断开）
 
-背压生效后，客户端**既不读也不断开**时该请求会连带上游连接一直挂着。实测残留在途成本：
-
-| 僵死连接数 | RSS 增量 | 上游连接持有 |
-|---|---|---|
-| 1 | +5 MB | 1 |
-| 10 | +45 MB | 10 |
-| 50 | +248 MB | 50（**永久持有**）|
-
-特性是**有界、不泄漏、客户端断开即回收**（RSS 曲线完全持平），但**连接数本身无上限**。
-
-默认**不处理**，因为僵死客户端与「卡在工具执行的合法客户端」在协议层无法区分；且官方 CLI 对上游没有任何 idle timeout（见 [#19](https://github.com/MAXeaglet/commandcode-proxy/issues/19)），贸然加超时会重蹈「误杀健康请求」。
-
-需要封顶时启用（opt-in）：
+僵死客户端会持有上游连接。启用写死线后自动丢弃（只要客户端在推进 drain 就不会触发）：
 
 ```bash
-# 下游持续阻塞超过 60s 才断开，正常客户端只要在推进 drain 就不会触发
-CC_CLIENT_DRAIN_TIMEOUT_MS=60000 npm start
+CC_CLIENT_STALL_MS=60000 ./cc-proxy
 ```
-
-启用后实测（50 个僵死连接）：上游连接持有数由 **50（永久）→ 0**，且丢弃后**不会**继续抽干上游。
 
 更稳妥的封顶仍在反向代理层（`limit_conn`），因为只有它知道该部署能承受多少并发。
 
 ### 其它注意事项
 
-- **`logFile` 是同步写**（`appendFileSync`），公网负载下会阻塞事件循环 —— 建议保持留空，从 stdout 收集。
-- **systemd 兜底**：配 `MemoryMax=` 与 `NODE_OPTIONS=--max-old-space-size=`，让超限杀掉 proxy 而不是 `sshd`/`nginx`。
-- **多账号 + 多实例**：`sessionStore` / `keyStateStore` 是进程内 `Map`。同一个 API key 打到两个实例会得到两个不同 session 与**两个不同设备指纹**，上游会看到「一个账号在多台机器上」。横向扩展请按 API key 做一致性哈希（`hash $cc_key consistent`），不要轮询。
+- **日志文件**：建议 `logFile` 留空、从 stdout 收集。
+- **systemd 兜底**：配 `MemoryMax=`，让超限杀掉 proxy 而不是 `sshd`/`nginx`。
+- **多账号 + 多实例**：per-key 的 session 与指纹状态在进程内存中。同一个 API key 打到两个实例会得到两个不同 session 与**两个不同设备指纹**，上游会看到「一个账号在多台机器上」。横向扩展请按 API key 做一致性哈希（`hash $cc_key consistent`），不要轮询。
 
 ## 免责声明
 
@@ -622,6 +641,11 @@ CC_CLIENT_DRAIN_TIMEOUT_MS=60000 npm start
 ## 开发
 
 ```bash
-# 带 watch 模式启动（文件修改自动重启）
-npm run dev
+go vet ./...
+go test -race ./...
+go build -o cc-proxy .
+python testdata/stub_cc.py 9701 &     # CC 上游桩
+CC_API_BASE=http://127.0.0.1:9701 CC_UPSTREAM_KEYS=user_test ./cc-proxy
 ```
+
+[Linux.do](https://linux.do)
