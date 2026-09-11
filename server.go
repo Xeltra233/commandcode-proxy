@@ -19,6 +19,10 @@ type proxyServer struct {
 	auth    *authenticator
 	limiter *inflightLimiter
 
+	// blockedModels：运行时自适应——上游以套餐原因拒绝的模型自动从
+	// 列表剔除（plan.go）
+	blockedModels *modelBlocklist
+
 	consecutiveTimeouts atomic.Int64
 }
 

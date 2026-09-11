@@ -119,6 +119,7 @@ func (s *proxyServer) handleMessages(w http.ResponseWriter, r *http.Request) {
 	}
 	if resp.StatusCode/100 != 2 {
 		mapped := mapCCStatus(resp.StatusCode, readErrorBody(resp))
+		s.noteUpstreamModelRejection(model, mapped.Message)
 		s.log.Error("CC API error (Anthropic)", "status", resp.StatusCode, "key", usedKey.label())
 		writeAnthropicError(w, mapped.Status, mapped.Type, mapped.Message, mapped.RetryAfter)
 		return

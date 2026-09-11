@@ -150,6 +150,8 @@ type ccClient struct {
 	modelsMu     sync.RWMutex
 	modelsCache  []modelInfo
 	modelsExpire time.Time
+
+	planDetector *planDetector
 }
 
 type modelInfo struct {
@@ -159,13 +161,14 @@ type modelInfo struct {
 
 func newCCClient(cfg *Config, log *logger) *ccClient {
 	c := &ccClient{
-		cfg:      cfg,
-		log:      log,
-		baseURL:  cfg.APIBase,
-		stream:   newUpstreamClient(cfg, cfg.StreamIdle),
-		nonstrm:  newUpstreamClient(cfg, cfg.NonstreamIdle),
-		short:    newUpstreamClient(cfg, 0),
-		slugMode: "fake",
+		cfg:          cfg,
+		log:          log,
+		baseURL:      cfg.APIBase,
+		stream:       newUpstreamClient(cfg, cfg.StreamIdle),
+		nonstrm:      newUpstreamClient(cfg, cfg.NonstreamIdle),
+		short:        newUpstreamClient(cfg, 0),
+		slugMode:     "fake",
+		planDetector: newPlanDetector(),
 	}
 	v := ccVersionFallback
 	c.version.Store(&v)
@@ -403,34 +406,7 @@ func (c *ccClient) projectSlugFor(sessionID string) string {
 
 // ── 模型列表 ────────────────────────────────────────
 
-var fallbackModels = []modelInfo{
-	{"claude-sonnet-4-6", "Claude Sonnet 4.6"},
-	{"claude-opus-4-8", "Claude Opus 4.8"},
-	{"claude-opus-4-7", "Claude Opus 4.7"},
-	{"claude-haiku-4-5-20251001", "Claude Haiku 4.5"},
-	{"gpt-5.5", "GPT-5.5"},
-	{"gpt-5.4", "GPT-5.4"},
-	{"gpt-5.4-mini", "GPT-5.4 Mini"},
-	{"gpt-5.3-codex", "GPT-5.3 Codex"},
-	{"deepseek/deepseek-v4-pro", "DeepSeek V4 Pro"},
-	{"deepseek/deepseek-v4-flash", "DeepSeek V4 Flash"},
-	{"moonshotai/Kimi-K2.6", "Kimi K2.6"},
-	{"moonshotai/Kimi-K2.5", "Kimi K2.5"},
-	{"zai-org/GLM-5.1", "GLM 5.1"},
-	{"zai-org/GLM-5", "GLM 5"},
-	{"MiniMaxAI/MiniMax-M3", "MiniMax M3"},
-	{"MiniMaxAI/MiniMax-M2.7", "MiniMax M2.7"},
-	{"MiniMaxAI/MiniMax-M2.5", "MiniMax M2.5"},
-	{"Qwen/Qwen3.6-Max-Preview", "Qwen 3.6 Max Preview"},
-	{"Qwen/Qwen3.6-Plus", "Qwen 3.6 Plus"},
-	{"Qwen/Qwen3.7-Max", "Qwen 3.7 Max"},
-	{"stepfun/Step-3.7-Flash", "Step 3.7 Flash"},
-	{"stepfun/Step-3.5-Flash", "Step 3.5 Flash"},
-	{"xiaomi/mimo-v2.5-pro", "MiMo V2.5 Pro"},
-	{"xiaomi/mimo-v2.5", "MiMo V2.5"},
-	{"google/gemini-3.5-flash", "Gemini 3.5 Flash"},
-	{"google/gemini-3.1-flash-lite", "Gemini 3.1 Flash Lite"},
-}
+// fallbackModels 见 fallback_models.go（官方目录快照，按套餐过滤见 plan.go）。
 
 func (c *ccClient) models(ctx context.Context, key *UpstreamKey) []modelInfo {
 	now := time.Now()

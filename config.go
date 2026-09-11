@@ -61,6 +61,13 @@ type Config struct {
 	// AllowBYOKeys：是否允许客户端自带上游 key（user_xxx）。nil = 未显式配置，
 	// 由"是否配置了 clientKeys"决定（配置了分发 key 就默认关闭）。
 	AllowBYOKeys *bool
+	// Plan：订阅套餐等级（go/goat/pro/provider/max）。
+	// go/goat 会把 premium 模型从模型列表里滤掉，保证列表返回的都能用；
+	// 空或 "all" 表示不过滤（默认）。
+	Plan string
+	// PlanPremiumModels：当前套餐下显式可用的 premium 模型
+	// （上游的 per-model allowance 名单未公开，需要手动补充）。
+	PlanPremiumModels []string
 
 	MaxBodyBytes  int64
 	StreamIdle    time.Duration
@@ -102,18 +109,20 @@ type fileConfig struct {
 	ZDR                    *bool `json:"zdr"`
 	EmptySystemPlaceholder *bool `json:"emptySystemPlaceholder"`
 
-	AllowBYOKeys        *bool   `json:"allowByoKeys"`
-	KeyStrategy         *string `json:"keyStrategy"`
-	KeyFailover         *int    `json:"keyFailover"`
-	KeyCooldownMs       *int    `json:"keyCooldownMs"`
-	MaxIdleConnsPerHost *int    `json:"maxIdleConnsPerHost"`
-	MaxConnsPerHost     *int    `json:"maxConnsPerHost"`
-	MaxBodyMB           *int    `json:"maxBodyMB"`
-	MaxInflight         *int    `json:"maxInflight"`
-	StreamIdleMs        *int    `json:"streamIdleMs"`
-	NonstreamIdleMs     *int    `json:"nonstreamIdleMs"`
-	ClientStallMs       *int    `json:"clientStallMs"`
-	ShutdownTimeoutMs   *int    `json:"shutdownTimeoutMs"`
+	Plan                *string  `json:"plan"`
+	PlanPremiumModels   []string `json:"planPremiumModels"`
+	AllowBYOKeys        *bool    `json:"allowByoKeys"`
+	KeyStrategy         *string  `json:"keyStrategy"`
+	KeyFailover         *int     `json:"keyFailover"`
+	KeyCooldownMs       *int     `json:"keyCooldownMs"`
+	MaxIdleConnsPerHost *int     `json:"maxIdleConnsPerHost"`
+	MaxConnsPerHost     *int     `json:"maxConnsPerHost"`
+	MaxBodyMB           *int     `json:"maxBodyMB"`
+	MaxInflight         *int     `json:"maxInflight"`
+	StreamIdleMs        *int     `json:"streamIdleMs"`
+	NonstreamIdleMs     *int     `json:"nonstreamIdleMs"`
+	ClientStallMs       *int     `json:"clientStallMs"`
+	ShutdownTimeoutMs   *int     `json:"shutdownTimeoutMs"`
 }
 
 var configWarnings []string
@@ -447,6 +456,10 @@ func loadConfig(configPath string) *Config {
 	if fc.EmptySystemPlaceholder != nil {
 		cfg.EmptySystemPlaceholder = *fc.EmptySystemPlaceholder
 	}
+	if fc.Plan != nil {
+		cfg.Plan = normalizePlan(*fc.Plan)
+	}
+	cfg.PlanPremiumModels = fc.PlanPremiumModels
 	if fc.AllowBYOKeys != nil {
 		v := *fc.AllowBYOKeys
 		cfg.AllowBYOKeys = &v
@@ -536,6 +549,12 @@ func loadConfig(configPath string) *Config {
 	}
 	if b, ok := envBool("CC_EMPTY_SYSTEM_PLACEHOLDER"); ok {
 		cfg.EmptySystemPlaceholder = b
+	}
+	if v, ok := envStr("CC_PLAN"); ok {
+		cfg.Plan = normalizePlan(v)
+	}
+	if v, ok := envStr("CC_PLAN_PREMIUM_MODELS"); ok {
+		cfg.PlanPremiumModels = splitList(v)
 	}
 	if b, ok := envBool("CC_ALLOW_BYO"); ok {
 		v := b

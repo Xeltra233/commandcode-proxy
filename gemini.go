@@ -210,6 +210,7 @@ func (s *proxyServer) handleGemini(w http.ResponseWriter, r *http.Request, model
 	}
 	if resp.StatusCode/100 != 2 {
 		mapped := mapCCStatus(resp.StatusCode, readErrorBody(resp))
+		s.noteUpstreamModelRejection(model, mapped.Message)
 		s.log.Error("CC API error (Gemini)", "status", resp.StatusCode, "key", usedKey.label())
 		geminiError(w, mapped.Status, mapped.Message)
 		return

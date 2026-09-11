@@ -88,6 +88,8 @@ commandcode-proxy/
 | `useProviderModels` | `true` | Dynamically fetch model list from Provider API |
 | `modelRefreshIntervalMs` | `300000` | Model list cache refresh interval (5 min) |
 | `zdr` | `false` | Request ZDR-only routing from Command Code |
+| `plan` | `""` | Plan tier override (`go`/`goat`/`pro`/`max`); empty = auto-detect from the billing API |
+| `planPremiumModels` | `[]` | Explicitly allowed premium models for restricted tiers |
 | `maxBodyMB` | `100` | Request body limit (413 beyond) |
 
 ### Environment Variables
@@ -107,6 +109,8 @@ commandcode-proxy/
 | `CC_MAX_INFLIGHT` | In-process concurrent request cap (default `0` = unlimited) |
 | `CC_MAX_BODY_MB` | `maxBodyMB` |
 | `CMD_ZDR` | `zdr` (`1` to enable) |
+| `CC_PLAN` | `plan` — manual override; auto-detection runs when unset |
+| `CC_PLAN_PREMIUM_MODELS` | `planPremiumModels` (comma-separated) |
 
 When ZDR is enabled, the proxy sends `x-cmd-zdr: 1` on Command Code generation requests
 and the fingerprint/lifecycle initialization requests. It does not add the header
@@ -322,6 +326,18 @@ Health check. Returns `OK`.
 | 401 | API Key missing / invalid format / rejected (Key must start with `user_`; sent via `Authorization: Bearer` or `x-api-key`) |
 | 429 | Zero output tokens, or idle timeout (30s streaming / 90s non-streaming) — SDK auto-retry with `Retry-After`; after 3 consecutive timeouts a "reduce context" hint is returned |
 | 502 | CC upstream error |
+
+## Plan & Model Availability
+
+The upstream model catalog (`GET /v1/models`) returns **every** model regardless of your subscription — a Claude Opus id showing up in the list does not mean your plan can call it. The proxy solves this in three layers:
+
+1. **Auto-detection (default)** — the proxy queries the same billing endpoints the official CLI uses (`/alpha/whoami` → `/alpha/billing/credits` + `/alpha/billing/subscriptions`) with your upstream key, learns the account's `planId` (`individual-go`, `individual-goat`, `individual-pro`, `individual-max`, …) and credit balance, and filters the model list accordingly. Results are cached 30 min (failures 2 min). Purchased/free credits unlock everything, exactly like the official access evaluation.
+2. **Static fallback** — if detection fails, a built-in plan table (extracted from the official CLI, including per-plan model blacklists such as Opus-on-Pro) can be forced with `CC_PLAN=go|goat|pro|max`.
+3. **Runtime adaptation** — if upstream rejects a model with a plan-related error anyway, that model is automatically excluded from the list for 1 hour.
+
+Result: the list the proxy returns only contains models the current account can actually call.
+
+Go-tier example (auto-detected): open-source models only — `deepseek/*`, `qwen/*`, `glm-*`, `kimi-*`, `minimax-*`, `mimo-*`, and the free models. Premium models (Claude/GPT/Gemini families) need Pro and above; on Pro the Opus / GPT-6-Astra / Fugu-Ultra tier is still excluded. On-demand credits (`/extra`) unlock everything.
 
 ## Model List
 

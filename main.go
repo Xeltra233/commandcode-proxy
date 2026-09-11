@@ -40,12 +40,13 @@ func main() {
 
 	cc := newCCClient(cfg, log)
 	ps := &proxyServer{
-		cfg:     cfg,
-		log:     log,
-		cc:      cc,
-		keys:    pool,
-		auth:    auth,
-		limiter: newInflightLimiter(cfg.MaxInflight),
+		cfg:           cfg,
+		log:           log,
+		cc:            cc,
+		keys:          pool,
+		auth:          auth,
+		limiter:       newInflightLimiter(cfg.MaxInflight),
+		blockedModels: newModelBlocklist(),
 	}
 
 	rootCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -139,9 +140,11 @@ func logStartupBanner(log *logger, cfg *Config, pool *keyPool, auth *authenticat
 	if auth.enabled {
 		authMode = fmt.Sprintf("%d distributed client key(s), upstream key from pool", len(auth.keys))
 	}
+	plan := orFallback(cfg.Plan, "all (no filtering)")
 	log.Info("CC Proxy started",
 		"url", "http://"+ln.Addr().String(),
 		"api", cfg.APIBase,
+		"plan", plan,
 		"upstreamKeys", pool.len(),
 		"downstreamAuth", authMode,
 		"keyStrategy", cfg.KeyStrategy,
@@ -230,6 +233,33 @@ func (s *proxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// modelsForPlan 过滤模型列表，保证返回的模型在当前账号套餐下可用。
+// 优先级：CC_PLAN 显式配置 > 自动探测（/alpha/billing 接口）> 不过滤。
+// 运行时拉黑（上游拒绝过的模型）在任何路径下都生效。
+func (s *proxyServer) modelsForPlan(ctx context.Context, models []modelInfo, key *UpstreamKey) []modelInfo {
+	// 运行时自适应：剔除上游以套餐原因拒绝过的模型
+	if s.blockedModels.len() > 0 {
+		out := make([]modelInfo, 0, len(models))
+		for _, m := range models {
+			if !s.blockedModels.blocked(m.ID) {
+				out = append(out, m)
+			}
+		}
+		models = out
+	}
+	// 显式配置优先（管理员明确指定了套餐等级）
+	if s.cfg.Plan != "" {
+		return filterModelsForPlan(models, s.cfg.Plan, s.cfg.PlanPremiumModels)
+	}
+	// 自动探测：用当前上游 key 查 billing 接口（带缓存与失败降级）
+	if pa, _ := s.cc.planAccessFor(ctx, key); pa != nil {
+		return filterModelsByPlanAccess(models, pa, s.blockedModels)
+	}
+	// 探测失败或账号无套餐：不阻塞列表返回；静态表也无法覆盖的
+	// 未知模型交给运行时拉黑机制逐步收敛
+	return models
+}
+
 type modelEntry struct {
 	ID      string `json:"id"`
 	Object  string `json:"object"`
@@ -263,10 +293,10 @@ func (s *proxyServer) handleGeminiModels(w http.ResponseWriter, r *http.Request)
 	}
 	ar, err := s.authorize(r)
 	if err != nil {
-		writeJSON(w, http.StatusOK, map[string]any{"models": build(fallbackModels)}, 0)
+		writeJSON(w, http.StatusOK, map[string]any{"models": build(s.modelsForPlan(r.Context(), fallbackModels, ar.upstream))}, 0)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"models": build(s.cc.models(r.Context(), ar.upstream))}, 0)
+	writeJSON(w, http.StatusOK, map[string]any{"models": build(s.modelsForPlan(r.Context(), s.cc.models(r.Context(), ar.upstream), ar.upstream))}, 0)
 }
 
 func (s *proxyServer) handleModels(w http.ResponseWriter, r *http.Request) {
@@ -282,8 +312,8 @@ func (s *proxyServer) handleModels(w http.ResponseWriter, r *http.Request) {
 	ar, err := s.authorize(r)
 	if err != nil {
 		// 与旧实现一致：模型列表不强制鉴权，取不到上游 key 时回静态列表
-		writeJSON(w, http.StatusOK, build(fallbackModels), 0)
+		writeJSON(w, http.StatusOK, build(s.modelsForPlan(r.Context(), fallbackModels, ar.upstream)), 0)
 		return
 	}
-	writeJSON(w, http.StatusOK, build(s.cc.models(r.Context(), ar.upstream)), 0)
+	writeJSON(w, http.StatusOK, build(s.modelsForPlan(r.Context(), s.cc.models(r.Context(), ar.upstream), ar.upstream)), 0)
 }

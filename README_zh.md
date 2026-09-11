@@ -88,6 +88,8 @@ commandcode-proxy/
 | `useProviderModels` | `true` | 从 Provider API 动态拉取模型列表 |
 | `modelRefreshIntervalMs` | `300000` | 模型列表缓存刷新间隔（5min） |
 | `zdr` | `false` | 请求 Command Code 使用 ZDR-only 路由 |
+| `plan` | `""` | 套餐等级覆盖（`go`/`goat`/`pro`/`max`）；空 = 从 billing 接口自动探测 |
+| `planPremiumModels` | `[]` | 受限套餐下显式放行的 premium 模型 |
 | `maxBodyMB` | `100` | 请求体上限（超出 413） |
 
 ### 环境变量
@@ -107,6 +109,8 @@ commandcode-proxy/
 | `CC_MAX_INFLIGHT` | 进程内在途请求上限（默认 `0` = 不限）|
 | `CC_MAX_BODY_MB` | `maxBodyMB` |
 | `CMD_ZDR` | `zdr`（`1` 开启） |
+| `CC_PLAN` | `plan` —— 手动覆盖；未设置时自动探测 |
+| `CC_PLAN_PREMIUM_MODELS` | `planPremiumModels`（逗号分隔） |
 
 开启 ZDR 后，代理会在 Command Code 生成请求以及 fingerprint/lifecycle 初始化请求中附加
 `x-cmd-zdr: 1`。npm 版本检查和代理自己的 `/provider/v1/models` 模型目录请求不会附加该
@@ -320,6 +324,18 @@ Google **Gemini API** 兼容。模型名从路径取（可含斜杠，如 `/v1be
 | 401 | API Key 缺失/格式不对/无效（Key 必须以 `user_` 开头；通过 `Authorization: Bearer`、`x-api-key`、`x-goog-api-key` 或 `?key=` 传入） |
 | 429 | 零输出 token，或流空闲超时（30s 流式 / 90s 非流式）——带 `Retry-After`，SDK 自动重试；连续 3 次超时返回"压缩上下文"提示 |
 | 502 | CC 上游错误 |
+
+## 套餐与模型可用性
+
+上游模型目录（`GET /v1/models`）返回的是**全量**模型，与订阅套餐无关——列表里出现 Claude Opus 不代表你的套餐能调它。代理分三层解决：
+
+1. **自动探测（默认）**——用上游 key 调官方 CLI 同款 billing 接口（`/alpha/whoami` → `/alpha/billing/credits` + `/alpha/billing/subscriptions`），拿到账号的 `planId`（`individual-go` / `individual-goat` / `individual-pro` / `individual-max` …）与额度，按官方访问评估逻辑过滤模型列表。结果缓存 30 分钟（失败 2 分钟）。充值/免费额度全解锁，与官方行为一致。
+2. **静态回退**——探测失败时可用内置套餐表（从官方 CLI 还原，含每套餐模型黑名单，如 Pro 下的 Opus）强制指定：`CC_PLAN=go|goat|pro|max`。
+3. **运行时自适应**——上游仍以套餐原因拒绝某模型时，自动把该模型从列表剔除 1 小时。
+
+最终效果：代理返回的模型列表只包含当前账号真正能调的模型。
+
+Go 套餐示例（自动探测）：仅开源模型——`deepseek/*`、`qwen/*`、`glm-*`、`kimi-*`、`minimax-*`、`mimo-*` 及免费模型。Premium（Claude/GPT/Gemini 系）需 Pro 及以上；Pro 下 Opus / GPT-6-Astra / Fugu-Utra 一档仍被排除。按量充值（`/extra`）全解锁。
 
 ## 模型列表
 

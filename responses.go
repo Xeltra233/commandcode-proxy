@@ -132,6 +132,7 @@ func (s *proxyServer) handleResponses(w http.ResponseWriter, r *http.Request) {
 	}
 	if resp.StatusCode/100 != 2 {
 		mapped := mapCCStatus(resp.StatusCode, readErrorBody(resp))
+		s.noteUpstreamModelRejection(model, mapped.Message)
 		s.log.Error("CC API error", "status", resp.StatusCode, "path", path, "key", usedKey.label())
 		writeResponsesError(w, mapped.Status, mapped.Type, mapped.Message, mapped.RetryAfter)
 		return
