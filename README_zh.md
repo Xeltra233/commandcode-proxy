@@ -111,6 +111,9 @@ commandcode-proxy/
 | `CMD_ZDR` | `zdr`（`1` 开启） |
 | `CC_PLAN` | `plan` —— 手动覆盖；未设置时自动探测 |
 | `CC_PLAN_PREMIUM_MODELS` | `planPremiumModels`（逗号分隔） |
+| `CC_UPSTREAM_PROXY` | `upstreamProxy` —— 上游出口代理（http/https/socks5）；部署机 IP 被上游 bot 规则拦截时使用 |
+| `upstreamProxy` | `""` | 同上，config.json 写法 |
+
 
 开启 ZDR 后，代理会在 Command Code 生成请求以及 fingerprint/lifecycle 初始化请求中附加
 `x-cmd-zdr: 1`。npm 版本检查和代理自己的 `/provider/v1/models` 模型目录请求不会附加该

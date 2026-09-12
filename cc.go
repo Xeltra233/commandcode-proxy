@@ -10,6 +10,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"runtime"
 	"strings"
@@ -183,9 +184,21 @@ func newCCClient(cfg *Config, log *logger) *ccClient {
 // 关键点：不使用全局 client.Timeout（长流会被整段掐断），改为在响应体上挂
 // "每次 Read 的空闲计时器" —— 只有上游真的静默超时才中断，语义与旧实现一致，
 // 且每次 Read 只做一次 timer.Reset，不新增 goroutine、不额外拷贝。
+// upstreamProxy：显式 CC_UPSTREAM_PROXY 优先（http/https/socks5），
+// 未设置时回落到标准 HTTPS_PROXY 环境变量。
+func upstreamProxy(cfg *Config) func(*http.Request) (*url.URL, error) {
+	if cfg.UpstreamProxy != "" {
+		u, err := url.Parse(cfg.UpstreamProxy)
+		if err == nil && u.Scheme != "" {
+			return func(*http.Request) (*url.URL, error) { return u, nil }
+		}
+	}
+	return http.ProxyFromEnvironment
+}
+
 func newUpstreamClient(cfg *Config, idle time.Duration) *http.Client {
 	tr := &http.Transport{
-		Proxy: http.ProxyFromEnvironment,
+		Proxy: upstreamProxy(cfg),
 		DialContext: (&net.Dialer{
 			Timeout:   10 * time.Second,
 			KeepAlive: 30 * time.Second,
@@ -280,6 +293,7 @@ func (c *ccClient) ensureInitialized(ctx context.Context, key *UpstreamKey) {
 
 	headers := func(req *http.Request) {
 		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("User-Agent", "cli")
 		req.Header.Set("x-cli-environment", "production")
 		req.Header.Set("Authorization", "Bearer "+key.Value)
 		req.Header.Set("x-command-code-version", c.versionString())
@@ -365,6 +379,7 @@ func (c *ccClient) generate(ctx context.Context, key *UpstreamKey, body []byte, 
 	}
 	h := req.Header
 	h.Set("Content-Type", "application/json")
+	h.Set("User-Agent", "cli")
 	h.Set("Authorization", "Bearer "+key.Value)
 	h.Set("x-cli-environment", "production")
 	h.Set("x-command-code-version", c.versionString())
@@ -446,8 +461,12 @@ func (c *ccClient) fetchModels(ctx context.Context, key *UpstreamKey) ([]modelIn
 		return nil, false
 	}
 	req.Header.Set("Authorization", "Bearer "+key.Value)
+	req.Header.Set("User-Agent", "cli")
 	req.Header.Set("x-cli-environment", "production")
 	req.Header.Set("x-command-code-version", c.versionString())
+	req.Header.Set("x-project-slug", c.projectSlugFor(key.sessionIDFor(time.Now())))
+	req.Header.Set("x-taste-learning", "false")
+	req.Header.Set("x-session-id", key.sessionIDFor(time.Now()))
 	resp, err := c.short.Do(req)
 	if err != nil {
 		c.log.Warn("Provider models fetch error, using cached list", "error", err.Error())

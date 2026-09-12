@@ -47,6 +47,11 @@ type Config struct {
 	UpstreamKeys []UpstreamKeyConfig
 	ClientKeys   []ClientKeyConfig
 
+	// UpstreamProxy：上游出口代理（http/https/socks5 URL）。空 = 走标准
+	// HTTPS_PROXY 环境变量；都不设则直连。用于部署机 IP 被上游
+	// Cloudflare bot 规则拦截时换出口。
+	UpstreamProxy string
+
 	LogFile  string
 	LogLevel string
 
@@ -525,6 +530,9 @@ func loadConfig(configPath string) *Config {
 	}
 	if v, ok := envStr("PROJECT_SLUG"); ok {
 		cfg.ProjectSlug = v
+	}
+	if v, ok := envStr("CC_UPSTREAM_PROXY"); ok {
+		cfg.UpstreamProxy = v
 	}
 	if v, ok := envStr("CC_UPSTREAM_KEYS", "CC_API_KEYS", "CC_API_KEY"); ok {
 		cfg.UpstreamKeys = parseUpstreamKeys(v)

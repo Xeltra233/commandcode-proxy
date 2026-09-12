@@ -111,6 +111,9 @@ commandcode-proxy/
 | `CMD_ZDR` | `zdr` (`1` to enable) |
 | `CC_PLAN` | `plan` — manual override; auto-detection runs when unset |
 | `CC_PLAN_PREMIUM_MODELS` | `planPremiumModels` (comma-separated) |
+| `CC_UPSTREAM_PROXY` | `upstreamProxy` — egress proxy URL (http/https/socks5) for upstream traffic; use when the deploy host's IP is blocked by upstream bot rules |
+| `upstreamProxy` | `""` | Same, via config.json |
+
 
 When ZDR is enabled, the proxy sends `x-cmd-zdr: 1` on Command Code generation requests
 and the fingerprint/lifecycle initialization requests. It does not add the header

@@ -131,8 +131,12 @@ func (c *ccClient) fetchPlanAccess(ctx context.Context, key *UpstreamKey) (*plan
 			return nil, err
 		}
 		req.Header.Set("Authorization", "Bearer "+key.Value)
+		req.Header.Set("User-Agent", "cli")
 		req.Header.Set("x-cli-environment", "production")
 		req.Header.Set("x-command-code-version", c.versionString())
+		req.Header.Set("x-project-slug", c.projectSlugFor(key.sessionIDFor(time.Now())))
+		req.Header.Set("x-taste-learning", "false")
+		req.Header.Set("x-session-id", key.sessionIDFor(time.Now()))
 		resp, err := c.short.Do(req)
 		if err != nil {
 			return nil, err
