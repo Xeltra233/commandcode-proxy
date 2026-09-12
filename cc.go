@@ -4,15 +4,17 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"net/url"
 	"os"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -89,6 +91,18 @@ var fingerprintCPUs = []struct {
 	{"AMD Ryzen 7 5800X3D", 8},
 }
 
+var fingerprintAppleCPUs = []struct {
+	Model string
+	Cores int
+}{
+	{"Apple M1", 8},
+	{"Apple M1 Pro", 10},
+	{"Apple M2", 8},
+	{"Apple M3", 10},
+	{"Apple M3 Pro", 12},
+	{"Apple M4", 10},
+}
+
 var (
 	fingerprintMems = []int{8, 16, 24, 32, 48, 64}
 	fingerprintTZs  = []string{
@@ -100,40 +114,134 @@ var (
 	fingerprintMacCounts = []int{2, 3, 4, 5}
 )
 
+// 官方指纹盐值与哈希公式，逐行还原自 CLI 1.53.0 buildMachineFingerprint：
+//
+//	hashSignal(v) = sha256(salt \0 lower(trim(v)))   空值 → 字段省略
+//	thumbmark     = sha256(salt \0machine\0 join(parts,"|"))
+//	parts         = 有 machineId: [machineId, macs]；否则 [macs, hostname, cpuModel]
+const fpSalt = "command-code:device-fingerprint:v1"
+
+func fpHash(v string) string {
+	t := strings.TrimSpace(v)
+	if t == "" {
+		return ""
+	}
+	h := sha256.New()
+	h.Write([]byte(fpSalt))
+	h.Write([]byte{0})
+	h.Write([]byte(strings.ToLower(t)))
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+// macFromHex 把 12 个 hex 字符格式化成小写冒号分隔的 MAC 地址。
+func macFromHex(hexStr string) string {
+	var b strings.Builder
+	for i := 0; i < 6; i++ {
+		if i > 0 {
+			b.WriteByte(':')
+		}
+		b.WriteString(hexStr[i*2 : i*2+2])
+	}
+	return b.String()
+}
+
+// fpThumbmark parts 与 CLI 一致：有 machineId 时 hostname/cpuModel 不参与。
+func fpThumbmark(machineID string, macs []string, hostname, cpuModel string) string {
+	var parts []string
+	if mid := strings.TrimSpace(machineID); mid != "" {
+		parts = append(parts, mid, strings.Join(macs, ","))
+	} else {
+		parts = append(parts, strings.Join(macs, ","), strings.TrimSpace(hostname), strings.TrimSpace(cpuModel))
+	}
+	var kept []string
+	for _, p := range parts {
+		if p != "" {
+			kept = append(kept, p)
+		}
+	}
+	payload := strings.Join(kept, "|")
+	if payload == "" {
+		payload = "unknown"
+	}
+	h := sha256.New()
+	h.Write([]byte(fpSalt))
+	h.Write([]byte("\x00machine\x00"))
+	h.Write([]byte(payload))
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+var (
+	fingerprintHostWords  = []string{"nova", "atlas", "iris", "pixel", "quartz", "ember", "willow", "cobalt", "drift", "pine"}
+	fingerprintGitDomains = []string{"gmail.com", "outlook.com", "proton.me", "github.com", "qq.com", "163.com"}
+)
+
+// hostnames/osRelease/machineId 与 platform 联动，保持与真实 CLI 采集一致。
 func newFingerprint() *fingerprint {
-	cpu := fingerprintCPUs[randInt63n(int64(len(fingerprintCPUs)))]
+	roll := randInt63n(100)
+	var platform, osRelease, hostname, machineID, cpuModel string
+	var cpuCount int
+	var arch = "x64"
+	switch {
+	case roll < 55: // windows 桌面（最常见）
+		platform = "win32"
+		osRelease = []string{"10.0.19045", "10.0.22631", "10.0.26100"}[randInt63n(3)]
+		hostname = "DESKTOP-" + strings.ToUpper(randHex(3))
+		machineID = newUUID()
+		cpu := fingerprintCPUs[randInt63n(int64(len(fingerprintCPUs)))]
+		cpuModel, cpuCount = cpu.Model, cpu.Cores
+	case roll < 80: // apple silicon / intel mac
+		platform = "darwin"
+		osRelease = []string{"23.5.0", "24.1.0", "24.3.0", "24.5.0"}[randInt63n(4)]
+		hostname = fingerprintHostWords[randInt63n(int64(len(fingerprintHostWords)))] + "-" +
+			[]string{"MacBook-Pro", "MacBook-Air", "Mac-mini"}[randInt63n(3)] + ".local"
+		machineID = strings.ToUpper(newUUID())
+		cpu := fingerprintAppleCPUs[randInt63n(int64(len(fingerprintAppleCPUs)))]
+		cpuModel, cpuCount, arch = cpu.Model, cpu.Cores, "arm64"
+	default: // linux 桌面/WSL/容器
+		platform = "linux"
+		osRelease = []string{"6.8.0-45-generic", "5.15.0-91-generic", "6.1.0-18-amd64"}[randInt63n(3)]
+		hostname = fingerprintHostWords[randInt63n(int64(len(fingerprintHostWords)))] + "-" + randHex(2)
+		machineID = randHex(16) // /etc/machine-id：32 hex
+		cpu := fingerprintCPUs[randInt63n(int64(len(fingerprintCPUs)))]
+		cpuModel, cpuCount = cpu.Model, cpu.Cores
+	}
 	mem := fingerprintMems[randInt63n(int64(len(fingerprintMems)))]
 	tz := fingerprintTZs[randInt63n(int64(len(fingerprintTZs)))]
-	macCount := fingerprintMacCounts[randInt63n(int64(len(fingerprintMacCounts)))]
+	macCount := 2 + int(randInt63n(4)) // 2~5 张网卡
 
-	macHashes := make([]string, 0, macCount)
+	var macs []string
 	for i := 0; i < macCount; i++ {
-		macHashes = append(macHashes, sha256Hex(randHex(32)))
+		macs = append(macs, macFromHex(randHex(6)))
+	}
+	osUser := fingerprintHostWords[randInt63n(int64(len(fingerprintHostWords)))] + strconv.Itoa(int(randInt63n(90))+10)
+	gitEmail := fingerprintHostWords[randInt63n(int64(len(fingerprintHostWords)))] +
+		strconv.Itoa(int(randInt63n(900))+100) + "@" +
+		fingerprintGitDomains[randInt63n(int64(len(fingerprintGitDomains)))]
+
+	macHashes := make([]string, 0, len(macs))
+	for _, m := range macs {
+		if h := fpHash(m); h != "" {
+			macHashes = append(macHashes, h)
+		}
 	}
 	parts := fingerprintComponents{
-		MachineIDHash:    sha256Hex(randHex(32)),
+		MachineIDHash:    fpHash(machineID),
 		MacHashes:        macHashes,
-		OSUserHash:       sha256Hex(randHex(16)),
-		HostnameHash:     sha256Hex(randHex(16)),
-		GitEmailHash:     sha256Hex(randHex(16)),
-		Platform:         "win32",
-		Arch:             "x64",
-		OSRelease:        "10.0.22631",
-		CPUModel:         cpu.Model,
-		CPUCount:         cpu.Cores,
+		OSUserHash:       fpHash(osUser),
+		HostnameHash:     fpHash(hostname),
+		GitEmailHash:     fpHash(gitEmail),
+		Platform:         platform,
+		Arch:             arch,
+		OSRelease:        osRelease,
+		CPUModel:         cpuModel,
+		CPUCount:         cpuCount,
 		MemGiB:           mem,
-		IsContainer:      false,
+		IsContainer:      platform == "linux" && randInt63n(100) < 40,
 		Timezone:         tz,
 		Runtime:          "cli",
 		CollectorVersion: 1,
 	}
-	thumbParts := []string{parts.MachineIDHash}
-	thumbParts = append(thumbParts, macHashes...)
-	thumbParts = append(thumbParts,
-		parts.OSUserHash, parts.HostnameHash, parts.GitEmailHash,
-		"win32", "10.0.22631", cpu.Model, fmt.Sprint(cpu.Cores), fmt.Sprint(mem),
-	)
-	return &fingerprint{Thumbmark: sha256Hex(strings.Join(thumbParts, "|")), Components: parts}
+	return &fingerprint{Thumbmark: fpThumbmark(machineID, macs, hostname, cpuModel), Components: parts}
 }
 
 // ── 上游客户端 ──────────────────────────────────────
