@@ -345,7 +345,7 @@ Result: the list the proxy returns only contains models the current account can 
 The proxy reproduces the official CLI's full request signature, byte for byte:
 
 - **Headers** — `User-Agent: cli`, `x-cli-environment`, `x-command-code-version` (live-fetched from npm), `x-project-slug`, `x-taste-learning`, `x-session-id` (per-key, rotates every 12h ± 1h like a real CLI session), `x-cmd-zdr`, and a W3C `traceparent`.
-- **Device fingerprint** — the `/alpha/fingerprint/record` payload follows the official formula (`sha256("command-code:device-fingerprint:v1" + " machine " + …)`), with plausible per-machine components: platform-linked OS release / hostname / machine-id formats, Apple-silicon CPU models on darwin, consistent CPU/mem/timezone combos, 2–5 MAC hashes. Each key keeps a stable fingerprint, re-registered on the official first-use + 8h±2h cadence, alongside `/alpha/lifecycle-events` (`cli_session_exists`).
+- **Device fingerprint** — the `/alpha/fingerprint/record` payload follows the official formula (`sha256("command-code:device-fingerprint:v1" + "\0machine\0" + …)`), with plausible per-machine components: platform-linked OS release / hostname / machine-id formats, Apple-silicon CPU models on darwin, consistent CPU/mem/timezone combos, 2–5 MAC hashes. Each key keeps a stable fingerprint, re-registered on the official first-use + 8h±2h cadence, alongside `/alpha/lifecycle-events` (`cli_session_exists`).
 
 If the deploy host's IP is still bot-challenged (datacenter IPs usually are), set `CC_UPSTREAM_PROXY` to route upstream traffic through a clean egress.
 

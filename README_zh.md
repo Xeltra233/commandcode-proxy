@@ -343,7 +343,7 @@ Google **Gemini API** 兼容。模型名从路径取（可含斜杠，如 `/v1be
 代理逐字节复刻官方 CLI 的完整请求签名：
 
 - **请求头**——`User-Agent: cli`、`x-cli-environment`、`x-command-code-version`（实时从 npm 拉取）、`x-project-slug`、`x-taste-learning`、`x-session-id`（每 key 独立，12h±1h 轮换，与真实 CLI 会话一致）、`x-cmd-zdr`、W3C `traceparent`。
-- **设备指纹**——`/alpha/fingerprint/record` 载荷严格按官方公式（`sha256("command-code:device-fingerprint:v1" + " machine " + …)`），组件高度拟真：platform 联动的 OS 版本 / 主机名 / machine-id 格式、darwin 配 Apple Silicon CPU 型号、CPU/内存/时区组合合理、2~5 张网卡哈希。每 key 固定一枚指纹，按官方"首次 + 8h±2h"节奏重新注册，并同步上报 `/alpha/lifecycle-events`（`cli_session_exists`）。
+- **设备指纹**——`/alpha/fingerprint/record` 载荷严格按官方公式（`sha256("command-code:device-fingerprint:v1" + "\0machine\0" + …)`），组件高度拟真：platform 联动的 OS 版本 / 主机名 / machine-id 格式、darwin 配 Apple Silicon CPU 型号、CPU/内存/时区组合合理、2~5 张网卡哈希。每 key 固定一枚指纹，按官方"首次 + 8h±2h"节奏重新注册，并同步上报 `/alpha/lifecycle-events`（`cli_session_exists`）。
 
 若部署机 IP 仍被 bot 规则挑战（数据中心 IP 很常见），设置 `CC_UPSTREAM_PROXY` 让上游流量走干净出口。
 
