@@ -109,6 +109,10 @@ type fileConfig struct {
 	LogFile  *string `json:"logFile"`
 	LogLevel *string `json:"logLevel"`
 
+	// UpstreamProxy：上游出口代理（http/https/socks5 URL），与
+	// CC_UPSTREAM_PROXY 等价；config 文件优先级低于环境变量。
+	UpstreamProxy *string `json:"upstreamProxy"`
+
 	UseProviderModels      *bool `json:"useProviderModels"`
 	ModelRefreshIntervalMs *int  `json:"modelRefreshIntervalMs"`
 	ZDR                    *bool `json:"zdr"`
@@ -443,6 +447,9 @@ func loadConfig(configPath string) *Config {
 	cfg.ClientKeys = append(cfg.ClientKeys, fc.ClientKeys...)
 	cfg.ClientKeys = append(cfg.ClientKeys, fc.ProxyKeys...)
 	cfg.ClientKeys = append(cfg.ClientKeys, fc.DownstreamKeys...)
+	if fc.UpstreamProxy != nil {
+		cfg.UpstreamProxy = *fc.UpstreamProxy
+	}
 	if fc.LogFile != nil {
 		cfg.LogFile = *fc.LogFile
 	}

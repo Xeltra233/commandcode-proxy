@@ -1,6 +1,7 @@
 package main
 
 import (
+	"net/http"
 	"os"
 	"path/filepath"
 	"testing"
@@ -153,5 +154,50 @@ func TestKeyPoolFailover(t *testing.T) {
 	}
 	if pool2.lookup("user_missing") != nil {
 		t.Error("lookup should return nil for unknown key")
+	}
+}
+
+// upstreamProxy：config.json 支持 + 环境变量覆盖（config 文件优先级低于 env）。
+func TestUpstreamProxyConfig(t *testing.T) {
+	dir := t.TempDir()
+
+	// 仅 config 文件
+	path := filepath.Join(dir, "config.json")
+	if err := os.WriteFile(path, []byte(`{"upstreamProxy":"socks5://127.0.0.1:20170"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("CC_UPSTREAM_PROXY", "")
+	cfg := loadConfig(path)
+	if cfg.UpstreamProxy != "socks5://127.0.0.1:20170" {
+		t.Errorf("UpstreamProxy from file = %q", cfg.UpstreamProxy)
+	}
+
+	// env 覆盖 config 文件
+	t.Setenv("CC_UPSTREAM_PROXY", "http://10.0.0.1:8080")
+	cfg = loadConfig(path)
+	if cfg.UpstreamProxy != "http://10.0.0.1:8080" {
+		t.Errorf("UpstreamProxy env override = %q", cfg.UpstreamProxy)
+	}
+
+	// 仅 env、无 config 字段
+	path2 := filepath.Join(dir, "empty.json")
+	if err := os.WriteFile(path2, []byte(`{}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg = loadConfig(path2)
+	if cfg.UpstreamProxy != "http://10.0.0.1:8080" {
+		t.Errorf("UpstreamProxy env only = %q", cfg.UpstreamProxy)
+	}
+}
+
+// upstreamProxy 非法值：不 panic，回落 ProxyFromEnvironment 行为。
+func TestUpstreamProxyInvalid(t *testing.T) {
+	t.Setenv("CC_UPSTREAM_PROXY", "")
+	defer t.Setenv("CC_UPSTREAM_PROXY", "")
+	cfg := &Config{UpstreamProxy: "::::not-a-url"}
+	tr := &http.Transport{Proxy: upstreamProxy(cfg)}
+	req, _ := http.NewRequest("GET", "http://example.com/", nil)
+	if _, err := tr.Proxy(req); err != nil {
+		t.Errorf("invalid proxy url should fall back gracefully, got %v", err)
 	}
 }
