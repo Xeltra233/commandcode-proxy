@@ -296,7 +296,7 @@ func (s *proxyServer) chatStream(w http.ResponseWriter, r *http.Request, resp *h
 		}
 		buf.reset()
 		buf.raw("data: ").raw(`{"error":{"message":`).str(st.upstreamErr.Message).
-			raw(`,"type":`).str(st.upstreamErr.Type).raw("}}")
+			raw(`,"type":`).str(st.upstreamErr.Type).raw("}")
 		if st.upstreamErr.RetryAfter > 0 {
 			buf.raw(`,"retry_after":`).int(int64(st.upstreamErr.RetryAfter))
 		}

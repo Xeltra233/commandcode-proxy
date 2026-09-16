@@ -876,7 +876,7 @@ func (s *proxyServer) responsesStream(w http.ResponseWriter, resp *http.Response
 		buf.raw(`,"incomplete_details":null`)
 	}
 	buf.raw(`,"usage":`).rawJSON(marshalTo(&enc, buildResponsesUsage(st.usage, st.outputTokens)))
-	buf.raw("}}")
+	buf.raw("}")
 	endFrame(buf)
 	_ = sw.Write(buf.bytes())
 	sw.Flush()
