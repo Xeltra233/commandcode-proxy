@@ -81,8 +81,9 @@ func (s *proxyServer) handleChatCompletions(w http.ResponseWriter, r *http.Reque
 
 	completionID := "chatcmpl-" + randHex(6)
 	created := unixNow()
+	includeUsage := req.StreamOptions != nil && req.StreamOptions.IncludeUsage
 	if stream {
-		s.chatStream(w, r, resp, model, completionID, created, start)
+		s.chatStream(w, r, resp, model, completionID, created, start, includeUsage)
 	} else {
 		s.chatNonStream(w, resp, model, completionID, created, start, path)
 	}
@@ -104,7 +105,7 @@ type openAIStream struct {
 }
 
 func (s *proxyServer) chatStream(w http.ResponseWriter, r *http.Request, resp *http.Response,
-	model, completionID string, created int64, start time.Time) {
+	model, completionID string, created int64, start time.Time, includeUsage bool) {
 	const path = "/v1/chat/completions"
 
 	sw := newSSEWriter(w, s.cfg.ClientStall)
@@ -232,7 +233,10 @@ func (s *proxyServer) chatStream(w http.ResponseWriter, r *http.Request, resp *h
 			beginOpenAIChunk(buf, completionID, model, created)
 			buf.raw("{}")
 			endOpenAIChunk(buf, fr)
-			appendOpenAIUsage(buf, u.InputTokens, u.OutputTokens, u.CachedInputTokens)
+			// include_usage 语义：usage 不进 choices chunk，单独发一个 choices 为空的收尾 chunk
+			if !includeUsage {
+				appendOpenAIUsage(buf, u.InputTokens, u.OutputTokens, u.CachedInputTokens)
+			}
 			finishOpenAIChunk(buf)
 			st.lastWrite = time.Now()
 			return sw.Write(buf.bytes())
@@ -313,6 +317,22 @@ func (s *proxyServer) chatStream(w http.ResponseWriter, r *http.Request, resp *h
 	}
 
 	s.noteSuccess()
+	if includeUsage && st.usage != nil {
+		if err := sw.Start(); err != nil {
+			return
+		}
+		u := st.usage
+		buf.reset()
+		buf.raw(`data: {"id":`).str(completionID).
+			raw(`,"object":"chat.completion.chunk","created":`).int(created).
+			raw(`,"model":`).str(model).
+			raw(`,"choices":[],"usage":{"prompt_tokens":`).int(u.InputTokens).
+			raw(`,"completion_tokens":`).int(u.OutputTokens).
+			raw(`,"total_tokens":`).int(u.InputTokens + u.OutputTokens).
+			raw(`,"prompt_tokens_details":{"cached_tokens":`).int(u.CachedInputTokens).
+			raw("}}}\n\n")
+		_ = sw.Write(buf.bytes())
+	}
 	if err := sw.Start(); err != nil {
 		return
 	}

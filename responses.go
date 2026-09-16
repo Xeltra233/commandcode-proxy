@@ -260,7 +260,13 @@ func convertResponsesToChat(req *responsesRequest) *chatRequest {
 		if err := json.Unmarshal(input, &items); err == nil {
 			for i := range items {
 				item := &items[i]
-				switch item.Type {
+				// 标准 Responses 数组项形如 {"role":"user","content":...}，无 type 字段；
+				// 仅带 role 的 item 按消息处理，否则整条用户输入会被静默丢弃。
+				itemType := item.Type
+				if itemType == "" && item.Role != "" {
+					itemType = "message"
+				}
+				switch itemType {
 				case "reasoning":
 					if t := item.reasoningText(); t != "" {
 						ensurePending().ReasoningContent = t

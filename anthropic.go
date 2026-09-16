@@ -42,6 +42,15 @@ type anthropicBlock struct {
 	ToolUseID    string          `json:"tool_use_id"`
 	Content      json.RawMessage `json:"content"`
 	CacheControl json.RawMessage `json:"cache_control"`
+	Source       *anthropicImageSource `json:"source"`
+}
+
+// anthropicImageSource 对应 image 内容块的 source 字段（base64 / url 两种形态）。
+type anthropicImageSource struct {
+	Type      string `json:"type"`
+	MediaType string `json:"media_type"`
+	Data      string `json:"data"`
+	URL       string `json:"url"`
 }
 
 type anthropicTool struct {
@@ -201,6 +210,7 @@ func convertAnthropicToChat(req *anthropicRequest) *chatRequest {
 		case "user":
 			text := bytes.Buffer{}
 			var toolResults []anthropicBlock
+			var images []chatContentPart
 			for j := range blocks {
 				b := &blocks[j]
 				switch b.Type {
@@ -208,6 +218,12 @@ func convertAnthropicToChat(req *anthropicRequest) *chatRequest {
 					text.WriteString(b.Text)
 				case "tool_result":
 					toolResults = append(toolResults, *b)
+				case "image":
+					if u := anthropicImageURL(b.Source); u != "" {
+						p := chatContentPart{Type: "image_url"}
+						p.ImageURL = &struct{ URL string `json:"url"` }{URL: u}
+						images = append(images, p)
+					}
 				}
 			}
 			// OpenAI 语义要求 tool 消息紧跟 assistant 的 tool_calls：
@@ -221,8 +237,19 @@ func convertAnthropicToChat(req *anthropicRequest) *chatRequest {
 				}
 				out.Messages = append(out.Messages, m)
 			}
-			if text.Len() > 0 {
-				out.Messages = append(out.Messages, chatMessage{Role: "user", Content: mustJSON(text.String())})
+			if text.Len() > 0 || len(images) > 0 {
+				m := chatMessage{Role: "user"}
+				if len(images) == 0 {
+					m.Content = mustJSON(text.String())
+				} else {
+					parts := make([]chatContentPart, 0, len(images)+1)
+					if text.Len() > 0 {
+						parts = append(parts, chatContentPart{Type: "text", Text: text.String()})
+					}
+					parts = append(parts, images...)
+					m.Content = mustJSON(parts)
+				}
+				out.Messages = append(out.Messages, m)
 			}
 		}
 	}
@@ -277,6 +304,27 @@ func convertAnthropicToChat(req *anthropicRequest) *chatRequest {
 		}
 	}
 	return out
+}
+
+// anthropicImageURL 把 image 块的 source 转成 OpenAI image_url 可用的 URL。
+func anthropicImageURL(src *anthropicImageSource) string {
+	if src == nil {
+		return ""
+	}
+	switch src.Type {
+	case "base64":
+		if src.Data == "" {
+			return ""
+		}
+		mt := src.MediaType
+		if mt == "" {
+			mt = "image/png"
+		}
+		return "data:" + mt + ";base64," + src.Data
+	case "url":
+		return src.URL
+	}
+	return ""
 }
 
 func anthropicSystemText(raw json.RawMessage) string {

@@ -25,6 +25,9 @@ type chatRequest struct {
 	PromptCacheKey      string          `json:"prompt_cache_key"`
 	Stop                json.RawMessage `json:"stop"`
 	User                string          `json:"user"`
+	StreamOptions       *struct {
+		IncludeUsage bool `json:"include_usage"`
+	} `json:"stream_options"`
 }
 
 func (r *chatRequest) effectiveMaxTokens() int {
