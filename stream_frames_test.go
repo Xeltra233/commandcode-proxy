@@ -48,6 +48,33 @@ func fakeCCUpstream(t *testing.T, ndjson string) *httptest.Server {
 	return srv
 }
 
+// fakeCCUpstreamStall 模拟"发了首事件后静默"的 CC 上游：用于验证首帧之前的空闲超时。
+// 上游连接保持打开（不 EOF），确保触发的是 StreamIdle 而不是干净 EOF。
+func fakeCCUpstreamStall(t *testing.T) *httptest.Server {
+	t.Helper()
+	release := make(chan struct{})
+	t.Cleanup(func() { close(release) })
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/alpha/generate":
+			w.Header().Set("Content-Type", "application/x-ndjson")
+			_, _ = io.WriteString(w, `{"type":"start"}`+"\n")
+			if f, ok := w.(http.Flusher); ok {
+				f.Flush()
+			}
+			select {
+			case <-release:
+			case <-r.Context().Done():
+			}
+		default:
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, `{"ok":true}`)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
 func newTestProxyServer(t *testing.T, ccURL string) *proxyServer {
 	t.Helper()
 	cfg := &Config{
@@ -206,5 +233,39 @@ func TestAnthropicStreamFramesAreValidJSON(t *testing.T) {
 	last := frames[len(frames)-1]
 	if last["type"] != "message_stop" {
 		t.Fatalf("last frame type = %v, want message_stop", last["type"])
+	}
+}
+
+// 回归（2026-09-17 线上事故）：上游只发了一个 start 事件后静默，首帧之前的空闲超时
+// 必须回 JSON 错误，让 new-api / SDK 依据状态码与 Retry-After 识别并重试。
+// 旧行为：idleErrorFrame 在未 Start 时直接返回错误、handler 零输出退出，
+// net/http 默认 200 + 空流 → new-api 记 end_reason=eof/ok，
+// pi 报 "Stream ended without finish_reason"（glm-5.3-flash，线上多次复现）。
+func TestChatStreamIdleBeforeFirstByteReturnsJSONError(t *testing.T) {
+	upstream := fakeCCUpstreamStall(t)
+	ps := newTestProxyServer(t, upstream.URL)
+	// idleFor 在请求时读取 cfg.StreamIdle，构造后改小即可生效
+	ps.cfg.StreamIdle = 200 * time.Millisecond
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
+		strings.NewReader(`{"model":"test-model","stream":true,"messages":[{"role":"user","content":"hi"}]}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+testDownstreamKey)
+	rec := httptest.NewRecorder()
+	ps.ServeHTTP(rec, req)
+
+	if rec.Code == http.StatusOK {
+		t.Fatalf("idle timeout before first byte returned 200 (empty stream); want JSON error, body=%q", rec.Body.String())
+	}
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("status = %d, want %d (body=%q)", rec.Code, http.StatusTooManyRequests, rec.Body.String())
+	}
+	var m map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &m); err != nil {
+		t.Fatalf("error body is not valid JSON: %v; body=%q", err, rec.Body.String())
+	}
+	errObj, ok := m["error"].(map[string]any)
+	if !ok || errObj["message"] == "" {
+		t.Fatalf("unexpected error body shape: %v", m)
 	}
 }

@@ -269,6 +269,13 @@ func (s *proxyServer) chatStream(w http.ResponseWriter, r *http.Request, resp *h
 			s.log.Warn("Stream idle timeout", "path", path, "model", model, "streaming", true,
 				"timeoutMs", s.cfg.StreamIdle.Milliseconds(), "elapsedMs", sinceMs(start),
 				"bytesReceived", st.bytes, "lastCcEvent", orNone(st.lastEvent))
+			// 首帧之前（尚未 Start）必须回 JSON 错误：否则 handler 零输出退出，
+			// net/http 默认回 200 + 空流，下游只能看到"流意外结束"（2026-09-17 glm 线上事故：
+			// new-api 记 end_reason=eof/ok，pi 报 Stream ended without finish_reason）。
+			if !sw.Started() {
+				writeOpenAIError(w, 429, "rate_limit_error", s.timeoutMessage(), 5)
+				return
+			}
 			if err := s.idleErrorFrame(sw, buf, s.timeoutMessage(), 5); err != nil {
 				return
 			}
