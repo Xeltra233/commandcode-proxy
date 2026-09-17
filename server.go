@@ -44,7 +44,7 @@ func (s *proxyServer) generateWithFailover(
 	stream, zdr bool,
 ) (*http.Response, *UpstreamKey, error) {
 	attempts := 1 + s.cfg.KeyFailover
-	if s.keys.len() <= 1 {
+	if s.keys.len() <= 1 || ar.byo || (ar.client != nil && ar.client.upstream != nil) {
 		attempts = 1
 	}
 	var excluded []bool

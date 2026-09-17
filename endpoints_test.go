@@ -117,3 +117,42 @@ func responsesPlain(raw json.RawMessage) string {
 	}
 	return string(raw)
 }
+
+func TestAnthropicSystemTextFilter(t *testing.T) {
+	raw := json.RawMessage(`[
+		{"type":"text","text":"line 1"},
+		{"type":"image","text":""},
+		{"type":"custom_meta","text":"ignored metadata"},
+		{"type":"text","text":""},
+		{"type":"text","text":"line 2"}
+	]`)
+	got := anthropicSystemText(raw)
+	want := "line 1\nline 2"
+	if got != want {
+		t.Errorf("anthropicSystemText = %q, want %q", got, want)
+	}
+}
+
+func TestConvertGeminiToChatMultiPartAssistant(t *testing.T) {
+	req := &geminiRequest{
+		Contents: []geminiContent{{
+			Role: "model",
+			Parts: []geminiPart{
+				{Text: "thinking...", Thought: true},
+				{Text: "part1 "},
+				{Text: "part2"},
+			},
+		}},
+	}
+	chat := convertGeminiToChat(req, "test-model")
+	if len(chat.Messages) != 1 {
+		t.Fatalf("expected 1 message, got %d", len(chat.Messages))
+	}
+	m := chat.Messages[0]
+	if m.ReasoningContent != "thinking..." {
+		t.Errorf("reasoning = %q, want thinking...", m.ReasoningContent)
+	}
+	if plain := responsesPlain(m.Content); plain != "part1 part2" {
+		t.Errorf("content = %q, want 'part1 part2'", plain)
+	}
+}

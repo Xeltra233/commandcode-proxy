@@ -345,7 +345,7 @@ func anthropicSystemText(raw json.RawMessage) string {
 	}
 	var sb bytes.Buffer
 	for i := range blocks {
-		if blocks[i].Type != "text" && blocks[i].Text == "" {
+		if blocks[i].Type != "text" || blocks[i].Text == "" {
 			continue
 		}
 		if sb.Len() > 0 {
@@ -524,16 +524,7 @@ func (s *proxyServer) messagesStream(w http.ResponseWriter, resp *http.Response,
 			mapped := mapCCEventError(&ev)
 			st.upstreamErr = &mapped
 			s.log.Warn("CC stream error (Anthropic)", "message", mapped.Message)
-			if err := sw.Start(); err != nil {
-				return err
-			}
-			buf.reset()
-			beginAnthropicEvent(buf, "error")
-			buf.raw(`{"type":"error","error":{"type":`).str(mapped.Type).
-				raw(`,"message":`).str(mapped.Message).raw("}}")
-			endFrame(buf)
-			st.lastWrite = time.Now()
-			return sw.Write(buf.bytes())
+			return nil
 
 		case "text-start", "reasoning-start", "start", "start-step",
 			"reasoning-end", "provider-metadata", "tool-input-start", "tool-input-delta",
@@ -598,7 +589,12 @@ func (s *proxyServer) messagesStream(w http.ResponseWriter, resp *http.Response,
 			writeAnthropicError(w, e.Status, e.Type, e.Message, e.RetryAfter)
 			return
 		}
-		// 已经下发过 error 事件（规范里 error 即终结）
+		buf.reset()
+		beginAnthropicEvent(buf, "error")
+		buf.raw(`{"type":"error","error":{"type":`).str(st.upstreamErr.Type).
+			raw(`,"message":`).str(st.upstreamErr.Message).raw("}}")
+		endFrame(buf)
+		_ = sw.Write(buf.bytes())
 		sw.Flush()
 		return
 	}

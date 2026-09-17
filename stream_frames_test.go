@@ -269,3 +269,99 @@ func TestChatStreamIdleBeforeFirstByteReturnsJSONError(t *testing.T) {
 		t.Fatalf("unexpected error body shape: %v", m)
 	}
 }
+
+// 回归：Anthropic 端点在上游首帧就是 error 时，必须回 JSON 错误与状态码，而非 200 流。
+func TestAnthropicStreamErrorBeforeFirstByteReturnsJSONError(t *testing.T) {
+	upstream := fakeCCUpstream(t, testStreamErrorEvent+"\n")
+	ps := newTestProxyServer(t, upstream.URL)
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages",
+		strings.NewReader(`{"model":"test-model","stream":true,"max_tokens":16,"messages":[{"role":"user","content":"hi"}]}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+testDownstreamKey)
+	rec := httptest.NewRecorder()
+	ps.ServeHTTP(rec, req)
+
+	if rec.Code == http.StatusOK {
+		t.Fatalf("stream error before first byte returned 200, want HTTP error: %s", rec.Body.String())
+	}
+	var m map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &m); err != nil {
+		t.Fatalf("response body is not valid JSON: %v, body=%s", err, rec.Body.String())
+	}
+	if m["type"] != "error" {
+		t.Fatalf("expected error type, got %v", m)
+	}
+}
+
+// 回归：Anthropic 端点在流中遇到 error 事件时，下发的 SSE error 帧必须是合法 JSON。
+func TestAnthropicStreamMidStreamErrorEventIsValidJSON(t *testing.T) {
+	upstream := fakeCCUpstream(t, `{"type":"text-delta","text":"hello"}
+`+testStreamErrorEvent+`
+`)
+	ps := newTestProxyServer(t, upstream.URL)
+	rec := postStream(t, ps, "/v1/messages",
+		`{"model":"test-model","stream":true,"max_tokens":16,"messages":[{"role":"user","content":"hi"}]}`)
+	frames := sseFrames(t, rec.Body.String())
+	if len(frames) == 0 {
+		t.Fatal("no SSE frames received")
+	}
+	last := frames[len(frames)-1]
+	if last["type"] != "error" {
+		t.Fatalf("last frame type = %v, want error", last["type"])
+	}
+}
+
+// 回归：jsonBuf.str 传入非法 UTF-8 序列时，不能产生多余双引号导致 JSON 破坏。
+func TestJSONBufInvalidUTF8(t *testing.T) {
+	buf := getJSONBuf()
+	defer putJSONBuf(buf)
+	buf.str("invalid \x80\xff utf8")
+	var s string
+	if err := json.Unmarshal(buf.bytes(), &s); err != nil {
+		t.Fatalf("jsonBuf.str produced invalid JSON for invalid UTF-8: %v; raw=%q", err, string(buf.bytes()))
+	}
+}
+
+// 回归：Gemini 端点流式终帧在上游 finishReason 为空时，仍应返回 STOP。
+func TestGeminiStreamFinishReasonDefaultStop(t *testing.T) {
+	upstream := fakeCCUpstream(t, `{"type":"text-delta","text":"hi"}
+{"type":"finish","finishReason":"","totalUsage":{"inputTokens":3,"outputTokens":1}}
+`)
+	ps := newTestProxyServer(t, upstream.URL)
+	rec := postStream(t, ps, "/v1beta/models/test-model:streamGenerateContent?alt=sse",
+		`{"contents":[{"role":"user","parts":[{"text":"hello"}]}]}`)
+	frames := sseFrames(t, rec.Body.String())
+	if len(frames) == 0 {
+		t.Fatal("no frames")
+	}
+	last := frames[len(frames)-1]
+	cands, _ := last["candidates"].([]any)
+	if len(cands) == 0 {
+		t.Fatalf("no candidates in last frame: %v", last)
+	}
+	cand0, _ := cands[0].(map[string]any)
+	if cand0["finishReason"] != "STOP" {
+		t.Errorf("finishReason = %v, want STOP", cand0["finishReason"])
+	}
+}
+
+// 回归：下游自带 key（BYO）失败时，重试次数必须为 1，不得越权轮询上游池。
+func TestServerFailoverDoesNotBypassBYOKey(t *testing.T) {
+	upstream := fakeCCUpstream(t, `{"type":"error","message":"<401> invalid"}`+"\n")
+	ps := newTestProxyServer(t, upstream.URL)
+	ps.cfg.KeyFailover = 3
+	// 带 user_xxx key (BYO) 发起请求
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
+		strings.NewReader(`{"model":"test-model","stream":false,"messages":[{"role":"user","content":"hi"}]}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer user_client_byo_key")
+	rec := httptest.NewRecorder()
+	ps.ServeHTTP(rec, req)
+
+	// 上游池里的 key 不应被尝试（requests 应为 0）
+	for _, k := range ps.keys.keys {
+		if reqs := k.requests.Load(); reqs > 0 {
+			t.Fatalf("upstream pool key %s was accessed %d times for BYO client request", k.label(), reqs)
+		}
+	}
+}

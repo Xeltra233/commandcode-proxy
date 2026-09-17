@@ -93,8 +93,8 @@ func (j *jsonBuf) rawJSON(b []byte) *jsonBuf {
 
 // str 写入一个 JSON 字符串字面量。
 func (j *jsonBuf) str(s string) *jsonBuf {
-	j.b = append(j.b, '"')
 	if utf8.ValidString(s) {
+		j.b = append(j.b, '"')
 		start := 0
 		for i := 0; i < len(s); i++ {
 			c := s[i]

@@ -809,7 +809,7 @@ func (s *proxyServer) responsesStream(w http.ResponseWriter, resp *http.Response
 			}
 			buf.reset()
 			beginResponsesEvent(buf, "error", st.nextSeq())
-			buf.raw(`"code":null,"message":`).str(msg).raw(`,"param":null}`)
+			buf.raw(`"error":{"type":"rate_limit_error","code":null,"message":`).str(msg).raw(`,"param":null}}`)
 			endFrame(buf)
 			_ = sw.Write(buf.bytes())
 			sw.Flush()
@@ -825,7 +825,7 @@ func (s *proxyServer) responsesStream(w http.ResponseWriter, resp *http.Response
 		}
 		buf.reset()
 		beginResponsesEvent(buf, "error", st.nextSeq())
-		buf.raw(`"code":null,"message":`).str(readErr.Error()).raw(`,"param":null}`)
+		buf.raw(`"error":{"type":"proxy_error","code":null,"message":`).str(readErr.Error()).raw(`,"param":null}}`)
 		endFrame(buf)
 		_ = sw.Write(buf.bytes())
 		sw.Flush()

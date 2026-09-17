@@ -290,7 +290,7 @@ func (s *proxyServer) chatStream(w http.ResponseWriter, r *http.Request, resp *h
 			writeOpenAIError(w, 502, "proxy_error", "Upstream error: "+readErr.Error(), 10)
 			return
 		}
-		_ = s.idleErrorFrame(sw, buf, readErr.Error(), 0)
+		_ = s.streamErrorFrame(sw, buf, "proxy_error", readErr.Error(), 0)
 		sw.Flush()
 		return
 	}
@@ -347,18 +347,22 @@ func (s *proxyServer) chatStream(w http.ResponseWriter, r *http.Request, resp *h
 	sw.Flush()
 }
 
-// idleErrorFrame 在流已经开始的情况下，用 SSE 数据帧回传错误（而不是改状态码）。
-func (s *proxyServer) idleErrorFrame(sw *sseWriter, buf *jsonBuf, msg string, retryAfter int) error {
+// streamErrorFrame 在流已经开始的情况下，用 SSE 数据帧回传错误（而不是改状态码）。
+func (s *proxyServer) streamErrorFrame(sw *sseWriter, buf *jsonBuf, typ, msg string, retryAfter int) error {
 	if !sw.Started() {
 		return errors.New("stream not started")
 	}
 	buf.reset()
-	buf.raw(`data: {"error":{"message":`).str(msg).raw(`,"type":"rate_limit_error"}`)
+	buf.raw(`data: {"error":{"message":`).str(msg).raw(`,"type":`).str(typ).raw("}")
 	if retryAfter > 0 {
 		buf.raw(`,"retry_after":`).int(int64(retryAfter))
 	}
 	buf.raw("}\n\n")
 	return sw.Write(buf.bytes())
+}
+
+func (s *proxyServer) idleErrorFrame(sw *sseWriter, buf *jsonBuf, msg string, retryAfter int) error {
+	return s.streamErrorFrame(sw, buf, "rate_limit_error", msg, retryAfter)
 }
 
 // ── 非流式 ──────────────────────────────────────────

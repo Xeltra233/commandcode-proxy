@@ -339,7 +339,16 @@ func convertGeminiToChat(req *geminiRequest, model string) *chatRequest {
 					if p.Thought {
 						pending.ReasoningContent += p.Text
 					} else {
-						pending.Content = mustJSON(geminiPartsText([]geminiPart{p}))
+						if len(pending.Content) == 0 {
+							pending.Content = mustJSON(p.Text)
+						} else {
+							var prev string
+							if json.Unmarshal(pending.Content, &prev) == nil {
+								pending.Content = mustJSON(prev + p.Text)
+							} else {
+								pending.Content = mustJSON(p.Text)
+							}
+						}
 					}
 				} else {
 					flushPending()
@@ -552,6 +561,7 @@ func (s *proxyServer) geminiNonStream(w http.ResponseWriter, resp *http.Response
 type geminiStreamState struct {
 	usage      *ccUsage
 	finish     string
+	finished   bool
 	hasContent bool
 	outputTok  int64
 	lastWrite  time.Time
@@ -570,7 +580,7 @@ func (st *geminiStreamState) chunk(text string, thought bool, tc *struct {
 		parts = append(parts, geminiPart{Text: text, Thought: thought})
 	}
 	c := geminiCandidate{Content: &geminiContent{Role: "model", Parts: parts}, Index: 0}
-	if st.finish != "" {
+	if st.finished {
 		c.FinishReason = mapGeminiFinishReason(st.finish)
 	}
 	return geminiResponse{Candidates: []geminiCandidate{c}, UsageMetadata: buildGeminiUsage(st.usage, st.outputTok)}
@@ -588,6 +598,7 @@ func (st *geminiStreamState) consume(ev *ccEvent) {
 		st.hasContent = true
 		st.outputTok += 20
 	case "finish":
+		st.finished = true
 		st.finish = ev.FinishReason
 		u := ev.TotalUsage
 		if u == nil {
@@ -722,6 +733,7 @@ func (s *proxyServer) geminiStreamSSE(w http.ResponseWriter, resp *http.Response
 	s.noteSuccess()
 	if !sw.Started() {
 		// 上游没有任何内容事件：输出一个仅含 usage 的终帧
+		st.finished = true
 		ch := st.chunk("", false, nil)
 		enc, _ := json.Marshal(&ch)
 		_ = sw.Start()
